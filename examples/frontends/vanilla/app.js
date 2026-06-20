@@ -1,8 +1,10 @@
 // Vanilla UI: spawns the worker, auto-loads the model on entrance, renders the
 // streaming chat. No framework, no bundler.
 
+// Q4_0 build: its quant types (Q4_0/Q4_1/Q6_K/F32) are all supported by the
+// loader. (Q4_K_M needs Q4_K/Q5_K dequant — a roadmap item.)
 const GGUF_URL =
-  "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf";
+  "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_0.gguf";
 const TOKENIZER_URL =
   "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json";
 
@@ -69,7 +71,8 @@ function send() {
   promptEl.value = "";
   setReady(false);
   statusEl.textContent = "generating…";
-  worker.postMessage({ type: "generate", prompt });
+  // Naive kernels + f32 weights are slow in-browser; keep the demo short.
+  worker.postMessage({ type: "generate", prompt, maxTokens: 48 });
 }
 
 sendEl.addEventListener("click", send);

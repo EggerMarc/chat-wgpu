@@ -1,5 +1,5 @@
 // Build-free Web Worker around the chat-wgpu wasm `LocalChat`. Plain ES module
-// — no bundler. `../pkg` is the `wasm-pack build --target web` output, which
+// — no bundler. `./pkg` is the `wasm-pack build --target web` output, which
 // browsers load directly.
 //
 // Runs the model off the main thread (the wasm `generate` is synchronous) and
@@ -7,7 +7,7 @@
 //   in:  { type:"load", ggufUrl, tokenizerUrl } | { type:"generate", prompt, maxTokens?, temperature? }
 //   out: { type:"status"|"progress"|"ready"|"token"|"done"|"error", ... }
 
-import init, { LocalChat } from "../pkg/chat_wgpu.js";
+import init, { LocalChat } from "./pkg/chat_wgpu.js";
 
 const CACHE = "chat-wgpu-v1";
 let chat = null;

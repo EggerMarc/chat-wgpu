@@ -7,3 +7,7 @@
 **/target
 **/node_modules
 .env
+
+# wasm-pack output
+**/pkg
+Cargo.lock
