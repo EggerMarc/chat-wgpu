@@ -6,7 +6,7 @@
 //! `cargo run --bin verify --features verify`.
 
 use chat_wgpu::context::GpuContext;
-use chat_wgpu::kernels;
+use chat_wgpu::kernels::{self, Activation, NormKind};
 
 fn main() {
     pollster::block_on(run());
@@ -26,9 +26,21 @@ async fn run() {
     fails += matmul_ones(&ctx).await;
     fails += matmul_identity(&ctx).await;
     fails += rmsnorm_ones(&ctx).await;
-    fails += swiglu_known(&ctx).await;
+    fails += rmsnorm_gemma(&ctx).await;
+    fails += glu_swiglu(&ctx).await;
+    fails += glu_geglu(&ctx).await;
     fails += rope_pos0_identity(&ctx).await;
     fails += rope_quarter_turn(&ctx).await;
+
+    // Family resolution sanity: each arch maps to the right kernel variants.
+    use chat_wgpu::families::FamilySpec;
+    for arch in ["qwen3", "qwen2", "llama", "mistral", "gemma2"] {
+        let s = FamilySpec::from_arch(arch);
+        println!(
+            "family {arch:>8} -> {:<6} norm={:?} act={:?} qk_norm={} qkv_bias={}",
+            s.name, s.norm, s.activation, s.use_qk_norm, s.attn_qkv_bias
+        );
+    }
 
     if fails == 0 {
         println!("\nall kernels verified ✅");
@@ -63,27 +75,51 @@ async fn matmul_identity(ctx: &GpuContext) -> u32 {
     report("matmul identity", &got, &bvals)
 }
 
-/// `rmsnorm(ones, weight=ones)` → every element equals `1/sqrt(1+eps)`.
+/// Plain `rmsnorm(ones, weight=ones)` → every element equals `1/sqrt(1+eps)`.
 async fn rmsnorm_ones(ctx: &GpuContext) -> u32 {
     let (rows, dim, eps) = (4usize, 1024usize, 1e-6f32);
     let x = ctx.storage(&vec![1.0f32; rows * dim]);
     let w = ctx.storage(&vec![1.0f32; dim]);
-    let y = kernels::rmsnorm(ctx, &x, &w, rows, dim, eps);
+    let y = kernels::rmsnorm(ctx, &x, &w, rows, dim, eps, NormKind::Plain);
     let got = ctx.read(&y, rows * dim).await;
     let expect = vec![1.0 / (1.0 + eps).sqrt(); rows * dim];
-    report("rmsnorm ones", &got, &expect)
+    report("rmsnorm plain ones", &got, &expect)
 }
 
-/// `swiglu` at constant inputs: `out = silu(g)*u` evaluated at the definition.
-async fn swiglu_known(ctx: &GpuContext) -> u32 {
+/// Gemma `rmsnorm(ones, weight=ones)` → gain is `1+w = 2`, so `2/sqrt(1+eps)`.
+async fn rmsnorm_gemma(ctx: &GpuContext) -> u32 {
+    let (rows, dim, eps) = (4usize, 1024usize, 1e-6f32);
+    let x = ctx.storage(&vec![1.0f32; rows * dim]);
+    let w = ctx.storage(&vec![1.0f32; dim]);
+    let y = kernels::rmsnorm(ctx, &x, &w, rows, dim, eps, NormKind::UnitShift);
+    let got = ctx.read(&y, rows * dim).await;
+    let expect = vec![2.0 / (1.0 + eps).sqrt(); rows * dim];
+    report("rmsnorm gemma ones", &got, &expect)
+}
+
+/// SwiGLU at constant inputs: `out = silu(g)*u` evaluated at the definition.
+async fn glu_swiglu(ctx: &GpuContext) -> u32 {
     let n = 4096usize;
     let (g, u) = (1.5f32, -0.7f32);
     let gate = ctx.storage(&vec![g; n]);
     let up = ctx.storage(&vec![u; n]);
-    let out = kernels::swiglu(ctx, &gate, &up, n);
+    let out = kernels::glu(ctx, &gate, &up, n, Activation::SwiGlu);
     let got = ctx.read(&out, n).await;
     let silu = g / (1.0 + (-g).exp());
-    report("swiglu const", &got, &vec![silu * u; n])
+    report("glu swiglu const", &got, &vec![silu * u; n])
+}
+
+/// GeGLU at constant inputs: `out = gelu_tanh(g)*u` evaluated at the definition.
+async fn glu_geglu(ctx: &GpuContext) -> u32 {
+    let n = 4096usize;
+    let (g, u) = (1.5f32, -0.7f32);
+    let gate = ctx.storage(&vec![g; n]);
+    let up = ctx.storage(&vec![u; n]);
+    let out = kernels::glu(ctx, &gate, &up, n, Activation::GeGlu);
+    let got = ctx.read(&out, n).await;
+    let c = 0.797_884_56f32; // sqrt(2/pi)
+    let gelu = 0.5 * g * (1.0 + (c * (g + 0.044715 * g * g * g)).tanh());
+    report("glu geglu const", &got, &vec![gelu * u; n])
 }
 
 /// RoPE at position 0 → rotation by zero angle → identity.

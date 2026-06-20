@@ -44,13 +44,32 @@ reimplementation — pure wgpu). Then: attention → q4 dequant-matmul → GGUF 
 (hand-parsed) → Qwen3 forward loop → `wasm-bindgen` `LocalChat` API. Target model
 families are in ROADMAP.md.
 
+## Family-agnostic, like chat-mlx
+
+The kernels are generic over the points where transformer families actually
+diverge — the RMSNorm gain (`NormKind::{Plain, UnitShift}`), the MLP activation
+(`Activation::{SwiGlu, GeGlu}`), QK-Norm, QKV bias, embedding tying, RoPE base,
+sliding window. One shader per op, branched on a uniform variant field. Each
+family is a small `FamilySpec` (in `src/families/`, beside the kernels) that
+pins those choices; a GGUF's `general.architecture` resolves to one. The forward
+loop reads the spec and dispatches the right variant — **no per-family kernel
+code**.
+
+```
+qwen3   -> norm=Plain     act=SwiGlu  qk_norm=true   qkv_bias=false
+qwen2   -> norm=Plain     act=SwiGlu  qk_norm=false  qkv_bias=true
+llama   -> norm=Plain     act=SwiGlu  (also the fallback for mistral, phi3, …)
+gemma   -> norm=UnitShift act=GeGlu   sliding_window=Some  softcap=Some
+```
+
 ## Layout
 
 ```
 src/
   context.rs        GpuContext: device/queue, pipeline cache, buffer + dispatch + readback
-  kernels/          WGSL kernels (*.wgsl) + host dispatch wrappers + CPU oracles
-  main.rs           `verify` — diffs every kernel vs CPU
+  kernels/          variant-parameterized WGSL kernels (*.wgsl) + host wrappers
+  families/         per-family FamilySpec (qwen3, qwen2, llama, gemma) + arch resolver
+  main.rs           `verify` — GPU known-answer checks (both variants) + family resolution
   wasm.rs           browser entry (LocalChat API — pending the forward loop)
 examples/
   bench/            WebGPU matmul benchmark (GFLOP/s, GPU vs CPU), native + browser page

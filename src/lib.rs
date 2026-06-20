@@ -10,6 +10,7 @@
 //! forward loop + GGUF loader + wasm API are the build-out — see ROADMAP.md.
 
 pub mod context;
+pub mod families;
 pub mod kernels;
 
 #[cfg(target_arch = "wasm32")]

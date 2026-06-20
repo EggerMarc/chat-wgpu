@@ -66,20 +66,24 @@ differs.
 
 ## 5. Model families
 
-Architecture is config-driven from GGUF metadata (`general.architecture`), same
-as chat-candle — no per-family source files. The current kernel set (plain
-RMSNorm, rotate-half RoPE, SwiGLU, GQA) already covers the Llama/Qwen line; the
-others are small, isolated kernel additions.
+Family-agnostic, like chat-mlx: variant-parameterized kernels + a `FamilySpec`
+per family in `src/families/`, resolved from GGUF `general.architecture`. The
+specs exist now (`from_arch` verified); each becomes "done" when the forward
+loop runs that family end-to-end.
 
-- [ ] **Qwen3** — first target. Per-head QK-Norm (extra RMSNorm on q/k), no QKV
-      bias, tied embeddings. Drives the initial bring-up.
+- [x] **spec layer** — `FamilySpec` + qwen3 / qwen2 / llama / gemma, arch
+      resolver with Llama fallback. Norm + activation variants verified on GPU.
+- [ ] **Qwen3** — first end-to-end target. Per-head QK-Norm, no QKV bias, tied
+      embeddings. Drives the initial bring-up.
 - [ ] **Qwen2 / Qwen2.5** — QKV bias, tied embeddings, no QK-Norm.
-- [ ] **Llama 3 / MiniCPM** — GQA, SwiGLU, RoPE; bias per `attention_bias`.
+- [ ] **Llama 3 / MiniCPM** — GQA, SwiGLU, RoPE; the baseline + fallback.
 - [ ] **Mistral** — Llama-shaped; sliding-window attention is the one addition.
-- [ ] **Gemma 2/3** — needs the `(1 + weight)` RMSNorm variant, `gelu`/`geglu`
-      MLP (vs SwiGLU), and logit soft-capping. A few gated kernel variants.
-- [ ] **Phi-3** — Llama-shaped with fused QKV / gate-up packing.
+- [ ] **Gemma 2/3** — exercises the `UnitShift` RMSNorm + `GeGLU` variants
+      (both verified); plus sliding window + logit soft-capping in the loop.
+- [ ] **Phi-3** — Llama-shaped; fused QKV / gate-up unpacking at load.
 
-Per-family work is confined to: which norm variant, which MLP activation, QKV
-bias on/off, QK-Norm on/off, and any attention masking (sliding window) — all
-selected from metadata at load, dispatching the right kernel variant.
+Per-family work is confined to: norm variant, MLP activation, QKV bias on/off,
+QK-Norm on/off, attention masking (sliding window), logit soft-cap — all on the
+`FamilySpec`, dispatching the right kernel variant. New families that fit the
+existing variants are a ~15-line spec file; genuinely new behavior (a new norm,
+a new activation) adds one branch to a kernel + one enum case.
