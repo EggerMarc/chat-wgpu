@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>chat-wgpu · vanilla</title>
+    <style>
+      body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+      h1 { font-size: 1.3rem; margin-bottom: 0; }
+      .muted { color: #777; font-size: 0.85rem; }
+      #status { background: #f4f4f4; border-radius: 6px; padding: 0.5rem 0.8rem; font-size: 0.85rem; margin: 1rem 0; }
+      #chat { display: flex; flex-direction: column; gap: 0.6rem; }
+      .user { align-self: flex-end; background: #2563eb; color: #fff; padding: 0.5rem 0.8rem; border-radius: 12px; max-width: 80%; white-space: pre-wrap; }
+      .bot  { align-self: flex-start; background: #f0f0f0; padding: 0.5rem 0.8rem; border-radius: 12px; max-width: 80%; white-space: pre-wrap; }
+      #composer { display: flex; gap: 0.5rem; margin-top: 1rem; }
+      #prompt { flex: 1; padding: 0.5rem; box-sizing: border-box; }
+    </style>
+  </head>
+  <body>
+    <h1>chat-wgpu — vanilla</h1>
+    <p class="muted">
+      Qwen3-0.6B (Q4_K_M) running locally on WebGPU via chat-wgpu compiled to
+      wasm. Weights auto-download on first load and cache in the browser. No
+      framework, no build step. Needs a WebGPU-capable browser.
+    </p>
+    <div id="status">starting…</div>
+    <div id="chat"></div>
+    <div id="composer">
+      <input id="prompt" type="text" placeholder="loading model…" disabled
+             value="What is the capital of France?" />
+      <button id="send" disabled>Send</button>
+    </div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

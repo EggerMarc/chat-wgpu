@@ -1,0 +1,43 @@
+[package]
+name = "chat-wgpu"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+description = "Clean-room WebGPU (WGSL) LLM inference for the browser. Hand-rolled kernels, GGUF weights, no candle. Native + wasm."
+
+[lib]
+name = "chat_wgpu"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+# Kernel-correctness harness: runs each WGSL kernel and diffs it against a CPU
+# reference. Native only.
+[[bin]]
+name = "verify"
+path = "src/main.rs"
+required-features = ["verify"]
+
+[dependencies]
+wgpu = "29"
+bytemuck = { version = "1", features = ["derive"] }
+futures = "0.3"
+
+# Tokenizer (HF) — the only non-kernel dependency; wasm-capable.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokenizers = "0.22"
+pollster = { version = "0.4", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
+
+[features]
+default = []
+verify = ["dep:pollster"]
+
+[profile.release]
+opt-level = 3

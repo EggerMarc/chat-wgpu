@@ -1,0 +1,9 @@
+.claude
+
+/target
+/cache
+/data
+
+**/target
+**/node_modules
+.env

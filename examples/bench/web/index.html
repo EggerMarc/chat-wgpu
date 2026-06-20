@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>chat-candle · WebGPU matmul spike</title>
+    <style>
+      body { font: 15px/1.5 system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+      pre { background: #f4f4f4; padding: 1rem; border-radius: 6px; white-space: pre-wrap; }
+      .muted { color: #777; font-size: 0.85rem; }
+    </style>
+  </head>
+  <body>
+    <h1>WebGPU matmul spike</h1>
+    <p class="muted">
+      Runs an f32 matmul as a WGSL compute shader (WebGPU) vs a naive CPU matmul,
+      in your browser. This is the feasibility test for porting chat-candle's
+      engine to a WebGPU backend. Needs a WebGPU-capable browser (recent
+      Chrome/Edge, or Safari Technology Preview).
+    </p>
+    <button id="run">Run benchmark</button>
+    <pre id="out"></pre>
+
+    <script type="module">
+      import init, { bench } from "./pkg/wgpu_spike.js";
+      await init();
+      const out = document.getElementById("out");
+      document.getElementById("run").addEventListener("click", async () => {
+        if (!navigator.gpu) {
+          out.textContent = "WebGPU not available in this browser.";
+          return;
+        }
+        out.textContent = "running…\n";
+        // [m, k, n, iters]: decode GEMV, prefill GEMM, bigger GEMV.
+        const cases = [
+          [1, 1024, 1024, 100],
+          [256, 1024, 1024, 50],
+          [1, 4096, 4096, 100],
+        ];
+        for (const [m, k, n, it] of cases) {
+          try {
+            const r = JSON.parse(await bench(m, k, n, it));
+            out.textContent +=
+              `m=${m} k=${k} n=${n} [${r.backend}]  ` +
+              `gpu ${r.gpu_ms.toFixed(2)}ms (${r.gpu_gflops.toFixed(0)} GFLOP/s)  ` +
+              `cpu ${r.cpu_ms.toFixed(1)}ms  →  ${r.speedup.toFixed(1)}× faster` +
+              `  (err ${r.max_abs_err})\n`;
+          } catch (e) {
+            out.textContent += `error: ${e}\n`;
+          }
+        }
+      });
+    </script>
+  </body>
+</html>
