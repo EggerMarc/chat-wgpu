@@ -8,6 +8,7 @@
 
 pub mod context;
 pub mod kernels;
+pub mod loader;
 pub mod model;
 
 #[cfg(target_arch = "wasm32")]

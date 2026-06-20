@@ -33,13 +33,25 @@ quantized and/or tiled across bindings — fp32 won't fit one buffer.
 
 ## 2. Model
 
-- [ ] **GGUF loader** — hand-parse the GGUF container (header, metadata,
-      tensor table) into typed weights; architecture-agnostic via
-      `general.architecture` (like chat-candle's loader). No candle dependency.
-- [ ] **Qwen3 forward loop** — embed → N decoder layers (rmsnorm, attention with
-      KV cache, swiglu) → final norm → lm-head → sample. Verified end-to-end
-      against chat-candle's CPU output for the same prompt/weights.
-- [ ] **KV cache** — preallocated per-layer GPU buffers.
+A model is a **trait** (`Model`): it loads its weights and composes its
+architecture in `forward`. The forward *is* the architecture — read it and you
+see the model; intermediates are local buffers tapped via `Hook` (mid-layer
+sampling for meta-ML). No config-flag struct.
+
+- [x] **`Model` trait + `Qwen3`** — load + forward composing the kernel building
+      blocks, with intermediate `Hook` taps. Runs on GPU (random weights).
+- [x] **Weight loaders** (`Weights` trait): hand-written **GGUF** (binary parse,
+      metadata, dequant F32/F16/Q8_0/Q4_0, transpose) and **Safetensors** (JSON
+      header, F32/F16/BF16, `config.json` metadata, GGUF↔HF name translation).
+      Unit-tested (parse + dequant round-trips). No candle.
+- [ ] GGUF **k-quants** (Q4_K / Q6_K dequant) — to load the common `*-Q4_K_M`
+      files; today errors with a clear message.
+- [ ] **attention building block: KV cache** — thread a multi-position cache
+      through `pos` (today decode attends to seq=1).
+- [ ] **full forward** — embedding gather → N layers → final norm → lm-head →
+      sample; verify end-to-end vs chat-candle for the same weights/prompt.
+- [ ] **Llama / Gemma** model impls — prove the components + kernels compose
+      (Llama = Qwen3 minus QK-Norm; Gemma swaps norm/activation + post-norms).
 - [ ] **sampling** — greedy + temp/top-k/top-p (on-device argmax where possible).
 
 ## 3. Browser API

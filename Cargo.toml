@@ -10,8 +10,8 @@ name = "chat_wgpu"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
-# Kernel-correctness harness: runs each WGSL kernel and diffs it against a CPU
-# reference. Native only.
+# Kernel-correctness harness: GPU known-answer checks + a Qwen3 forward + loader
+# round-trip tests. Native only.
 [[bin]]
 name = "verify"
 path = "src/main.rs"
@@ -21,6 +21,8 @@ required-features = ["verify"]
 wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 futures = "0.3"
+# JSON: safetensors headers and config.json. (GGUF is binary — no JSON there.)
+serde_json = "1"
 
 # Tokenizer (HF) — the only non-kernel dependency; wasm-capable.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
