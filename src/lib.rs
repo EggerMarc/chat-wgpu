@@ -1,18 +1,14 @@
 //! chat-wgpu — a clean-room WebGPU LLM inference engine.
 //!
-//! Hand-rolled WGSL kernels, GGUF weights, HF tokenizer; no candle, no other ML
-//! framework. Targets the browser (WebGPU via wasm) and runs natively (Metal /
-//! Vulkan / DX12 via wgpu) for development and kernel verification.
-//!
-//! Status: foundation. The GPU context + matmul kernel are in place and
-//! verified vs CPU (`cargo run --bin verify --features verify`). The remaining
-//! kernels (rmsnorm, rope, swiglu, attention, q4 dequant-matmul) and the Qwen3
-//! forward loop + GGUF loader + wasm API are the build-out — see ROADMAP.md.
+//! Hand-rolled WGSL kernel building blocks (`kernels`), composed by per-model
+//! `forward` functions (`model`). A model is a trait that loads its weights and
+//! composes its architecture — no framework, no candle. Targets the browser
+//! (WebGPU via wasm) and runs natively (Metal / Vulkan / DX12) for development
+//! and kernel verification.
 
-pub mod arch;
 pub mod context;
-pub mod families;
 pub mod kernels;
+pub mod model;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
