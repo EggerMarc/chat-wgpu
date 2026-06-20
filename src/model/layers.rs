@@ -22,6 +22,31 @@ impl Linear {
         Self { w: mat, bias, in_f, out_f }
     }
 
+    /// Fuse several projections that share the same input into one matmul by
+    /// concatenating their weights along the output dim (e.g. QKV, gate+up).
+    /// `parts` = `(tensor_name, out_f)`. No bias (the families that fuse — Qwen3
+    /// QKV, all gate/up — have none).
+    pub fn load_fused(
+        ctx: &GpuContext,
+        w: &mut dyn Weights,
+        in_f: usize,
+        parts: &[(&str, usize)],
+    ) -> Self {
+        let out_total: usize = parts.iter().map(|(_, o)| o).sum();
+        let mut data = vec![0f32; in_f * out_total];
+        let mut col = 0;
+        for (name, out_f) in parts {
+            let m = w.matrix_data(&format!("{name}.weight"), in_f, *out_f); // [in_f, out_f]
+            for i in 0..in_f {
+                for o in 0..*out_f {
+                    data[i * out_total + col + o] = m[i * out_f + o];
+                }
+            }
+            col += out_f;
+        }
+        Self { w: ctx.storage(&data), bias: None, in_f, out_f: out_total }
+    }
+
     /// `x: [rows, in_f] -> [rows, out_f]`.
     pub fn forward(&self, ctx: &GpuContext, x: &wgpu::Buffer, rows: usize) -> wgpu::Buffer {
         let y = matmul::matmul(ctx, x, &self.w, rows, self.in_f, self.out_f);

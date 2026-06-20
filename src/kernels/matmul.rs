@@ -16,8 +16,15 @@ pub fn matmul(
     let c = ctx.empty(m * n);
     let dims = [m as u32, k as u32, n as u32, 0u32];
     let dims_buf = ctx.uniform(bytemuck::cast_slice(&dims));
-    let pipeline = ctx.pipeline("matmul", WGSL, "main");
-    let wg = ((n as u32).div_ceil(16), (m as u32).div_ceil(16), 1);
+    // Decode (m == 1) uses the 1-D GEMV path; prefill/m>1 uses the 2-D tile.
+    let (pipeline, wg) = if m == 1 {
+        (ctx.pipeline("matmul_gemv", WGSL, "gemv"), ((n as u32).div_ceil(256), 1, 1))
+    } else {
+        (
+            ctx.pipeline("matmul", WGSL, "main"),
+            ((n as u32).div_ceil(16), (m as u32).div_ceil(16), 1),
+        )
+    };
     ctx.run(&pipeline, &[a, b, &c, &dims_buf], wg);
     c
 }

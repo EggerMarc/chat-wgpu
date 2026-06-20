@@ -16,6 +16,15 @@ pub struct GpuContext {
     pub queue: wgpu::Queue,
     pub backend: String,
     pipelines: RefCell<HashMap<&'static str, wgpu::ComputePipeline>>,
+    /// Ops record into this shared encoder and are submitted in one batch at the
+    /// next `read`/`flush`, instead of one `queue.submit` per op. Hundreds of
+    /// dispatches per token → one command buffer.
+    encoder: RefCell<Option<wgpu::CommandEncoder>>,
+    /// Resources referenced by the pending encoder must outlive it until submit
+    /// (the caller's buffer handles may drop sooner). Bind groups hold their
+    /// buffers; `copy` has no bind group, so its buffers are retained directly.
+    retained_bg: RefCell<Vec<wgpu::BindGroup>>,
+    retained_buf: RefCell<Vec<wgpu::Buffer>>,
 }
 
 impl GpuContext {
@@ -46,7 +55,30 @@ impl GpuContext {
             queue,
             backend,
             pipelines: RefCell::new(HashMap::new()),
+            encoder: RefCell::new(None),
+            retained_bg: RefCell::new(Vec::new()),
+            retained_buf: RefCell::new(Vec::new()),
         })
+    }
+
+    /// Run a closure with the shared command encoder, lazily creating it.
+    fn record(&self, f: impl FnOnce(&mut wgpu::CommandEncoder)) {
+        let mut slot = self.encoder.borrow_mut();
+        let enc = slot.get_or_insert_with(|| {
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None })
+        });
+        f(enc);
+    }
+
+    /// Submit any pending recorded ops as one command buffer, then release the
+    /// resources that were keeping them alive.
+    pub fn flush(&self) {
+        if let Some(enc) = self.encoder.borrow_mut().take() {
+            self.queue.submit([enc.finish()]);
+            self.retained_bg.borrow_mut().clear();
+            self.retained_buf.borrow_mut().clear();
+        }
     }
 
     /// Get-or-build a compute pipeline for `(name, wgsl, entry)`, cached by name.
@@ -96,17 +128,19 @@ impl GpuContext {
     /// Used to write a new token's K/V into the preallocated KV cache, and to
     /// gather an embedding row.
     pub fn copy(&self, src: &wgpu::Buffer, src_off: usize, dst: &wgpu::Buffer, dst_off: usize, len: usize) {
-        let mut enc = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        enc.copy_buffer_to_buffer(
-            src,
-            (src_off * 4) as u64,
-            dst,
-            (dst_off * 4) as u64,
-            (len * 4) as u64,
-        );
-        self.queue.submit([enc.finish()]);
+        self.record(|enc| {
+            enc.copy_buffer_to_buffer(
+                src,
+                (src_off * 4) as u64,
+                dst,
+                (dst_off * 4) as u64,
+                (len * 4) as u64,
+            );
+        });
+        // Keep both buffers alive until the batch submits.
+        let mut bufs = self.retained_buf.borrow_mut();
+        bufs.push(src.clone());
+        bufs.push(dst.clone());
     }
 
     pub fn uniform(&self, bytes: &[u8]) -> wgpu::Buffer {
@@ -133,23 +167,25 @@ impl GpuContext {
             layout: &pipeline.get_bind_group_layout(0),
             entries: &entries,
         });
-        let mut enc = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
+        // Record into the shared encoder; submitted in a batch at the next read.
+        // Keep the bind group (and thus its buffers) alive until that submit.
+        let pipeline = pipeline.clone();
+        self.record(|enc| {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: None,
                 timestamp_writes: None,
             });
-            pass.set_pipeline(pipeline);
+            pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
-        }
-        self.queue.submit([enc.finish()]);
+        });
+        self.retained_bg.borrow_mut().push(bind_group);
     }
 
-    /// Read a storage buffer of `len` f32s back to the host.
+    /// Read a storage buffer of `len` f32s back to the host. Flushes any pending
+    /// recorded ops first, so the readback sees their results.
     pub async fn read(&self, src: &wgpu::Buffer, len: usize) -> Vec<f32> {
+        self.flush();
         let size = (len * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging"),

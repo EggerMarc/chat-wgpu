@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 
 use super::dequant;
-use crate::context::GpuContext;
 use crate::model::Weights;
 
 struct Entry {
@@ -131,7 +130,7 @@ impl Weights for SafetensorsWeights {
     fn has(&self, name: &str) -> bool {
         self.tensors.contains_key(&to_hf(name))
     }
-    fn matrix(&mut self, ctx: &GpuContext, name: &str, in_f: usize, out_f: usize) -> wgpu::Buffer {
+    fn matrix_data(&mut self, name: &str, in_f: usize, out_f: usize) -> Vec<f32> {
         // HF stores [out, in] row-major; our matmul B operand is [in, out].
         let w = self.tensor_f32(&to_hf(name)).expect("tensor");
         let mut b = vec![0f32; in_f * out_f];
@@ -140,10 +139,10 @@ impl Weights for SafetensorsWeights {
                 b[i * out_f + o] = w[o * in_f + i];
             }
         }
-        ctx.storage(&b)
+        b
     }
-    fn vector(&mut self, ctx: &GpuContext, name: &str, _len: usize) -> wgpu::Buffer {
-        ctx.storage(&self.tensor_f32(&to_hf(name)).expect("tensor"))
+    fn vector_data(&mut self, name: &str, _len: usize) -> Vec<f32> {
+        self.tensor_f32(&to_hf(name)).expect("tensor")
     }
 }
 

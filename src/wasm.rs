@@ -80,6 +80,7 @@ impl LocalChat {
         for &t in ids {
             let x = model.embed(ctx, t);
             hidden = Some(model.forward(ctx, &x, pos, &mut cache, &mut ()));
+            ctx.flush(); // one command buffer per token
             pos += 1;
         }
 
@@ -106,6 +107,7 @@ impl LocalChat {
 
             let x = model.embed(ctx, next);
             hidden = Some(model.forward(ctx, &x, pos, &mut cache, &mut ()));
+            ctx.flush();
             pos += 1;
         }
         Ok(shown)

@@ -204,11 +204,11 @@ impl Weights for RandomWeights {
     fn has(&self, _name: &str) -> bool {
         false // no biases in the random model
     }
-    fn matrix(&mut self, ctx: &GpuContext, name: &str, in_f: usize, out_f: usize) -> wgpu::Buffer {
-        ctx.storage(&fill(seed(name), in_f * out_f))
+    fn matrix_data(&mut self, name: &str, in_f: usize, out_f: usize) -> Vec<f32> {
+        fill(seed(name), in_f * out_f)
     }
-    fn vector(&mut self, ctx: &GpuContext, name: &str, len: usize) -> wgpu::Buffer {
-        ctx.storage(&fill(seed(name), len))
+    fn vector_data(&mut self, name: &str, len: usize) -> Vec<f32> {
+        fill(seed(name), len)
     }
 }
 

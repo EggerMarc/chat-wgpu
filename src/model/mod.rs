@@ -66,6 +66,7 @@ pub async fn generate<M: Model>(
     for &t in prompt {
         let x = model.embed(ctx, t);
         hidden = Some(model.forward(ctx, &x, pos, &mut cache, hook));
+        ctx.flush(); // one command buffer per token
         pos += 1;
     }
 
@@ -73,11 +74,12 @@ pub async fn generate<M: Model>(
     let mut produced = Vec::with_capacity(max_new);
     for _ in 0..max_new {
         let logits = model.logits(ctx, hidden.as_ref().unwrap());
-        let lv = ctx.read(&logits, vocab).await;
+        let lv = ctx.read(&logits, vocab).await; // flushes the lm-head batch
         let next = argmax(&lv);
         produced.push(next);
         let x = model.embed(ctx, next);
         hidden = Some(model.forward(ctx, &x, pos, &mut cache, hook));
+        ctx.flush();
         pos += 1;
     }
     produced
@@ -101,11 +103,21 @@ pub trait Weights {
     fn meta_f32(&self, key: &str) -> f32;
     /// Is a tensor present? (e.g. to detect a bias or a tied lm-head.)
     fn has(&self, name: &str) -> bool;
-    /// A weight matrix as `[in_f, out_f]` — the matmul B operand. (The loader
-    /// transposes GGUF's `[out, in]` and dequantizes.)
-    fn matrix(&mut self, ctx: &GpuContext, name: &str, in_f: usize, out_f: usize) -> wgpu::Buffer;
-    /// A weight vector of length `len` (norm gains, biases).
-    fn vector(&mut self, ctx: &GpuContext, name: &str, len: usize) -> wgpu::Buffer;
+    /// A weight matrix as `[in_f, out_f]` host data — the matmul B operand. (The
+    /// loader transposes GGUF's `[out, in]` and dequantizes.) Host-side so it can
+    /// be concatenated (fused QKV / gate-up) before upload.
+    fn matrix_data(&mut self, name: &str, in_f: usize, out_f: usize) -> Vec<f32>;
+    /// A weight vector of length `len` host data (norm gains, biases).
+    fn vector_data(&mut self, name: &str, len: usize) -> Vec<f32>;
+
+    /// Upload a matrix to a GPU buffer.
+    fn matrix(&mut self, ctx: &GpuContext, name: &str, in_f: usize, out_f: usize) -> wgpu::Buffer {
+        ctx.storage(&self.matrix_data(name, in_f, out_f))
+    }
+    /// Upload a vector to a GPU buffer.
+    fn vector(&mut self, ctx: &GpuContext, name: &str, len: usize) -> wgpu::Buffer {
+        ctx.storage(&self.vector_data(name, len))
+    }
 }
 
 /// A tap on the forward pass. `forward` calls `tap` at each named intermediate,

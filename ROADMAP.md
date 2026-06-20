@@ -55,9 +55,26 @@ sampling for meta-ML). No config-flag struct.
       (Llama = Qwen3 minus QK-Norm; Gemma swaps norm/activation + post-norms).
 - [ ] **sampling** — temp/top-k/top-p, on-device argmax (avoid the per-token
       logits readback).
-- [ ] **perf** — the kernels are one-thread-per-row/element for correctness;
-      tiled GEMM + flash attention + q4-in-VRAM dequant-matmul are the levers
-      (the spike measured ~5–49× headroom).
+- [ ] **perf** — Qwen3-0.6B Q4_0 on Metal: **~2.6 tok/s** (was 1.8). Measured
+      findings:
+      - **command-buffer batching** (one submit/token vs ~250): *no change* —
+        submit overhead wasn't the bottleneck. Kept anyway (cleaner, needed for
+        browser).
+      - **dedicated M=1 GEMV** decode path (no wasted threads, no integer
+        division): **1.4×**, the win so far.
+      - flat 1-thread-per-output (idx/n, idx%n): *regressed* — GPU integer
+        division is expensive.
+      - shared-memory A cache: *regressed* — 16 KB/workgroup tanks occupancy on
+        the 151936-wide lm-head.
+      - We're ~50× below memory-bandwidth peak → **latency/occupancy bound** on
+        many small serial GEMVs, not bandwidth bound.
+      - **fused QKV** (3 GEMVs → 1 wide GEMV of width q+2·kv, weights concat at
+        load, q/k/v sliced out): **1.15×** → 2.9 tok/s. Numerically exact
+        (random-weight argmax unchanged). The `Weights::matrix_data` +
+        `Linear::load_fused` machinery generalizes to gate+up.
+      Next levers: **fused gate+up** (same pattern, the widest matmuls) and
+      **q4-in-VRAM dequant-matmul** (8× less weight traffic, pays off once
+      bandwidth-bound). Flash-style attention later.
 
 ## 3. Browser API
 

@@ -14,9 +14,7 @@ use crate::kernels::{activation, attention, rope};
 
 struct Layer {
     attn_norm: RmsNorm,
-    wq: Linear,
-    wk: Linear,
-    wv: Linear,
+    wqkv: Linear, // fused q/k/v projection (one wide GEMV instead of three)
     wo: Linear,
     q_norm: RmsNorm, // per-head QK-Norm — the Qwen3 distinctive
     k_norm: RmsNorm,
@@ -62,9 +60,16 @@ impl Model for Qwen3 {
                 let p = format!("blk.{i}");
                 Layer {
                     attn_norm: RmsNorm::load(ctx, w, &format!("{p}.attn_norm"), dim, eps, false),
-                    wq: Linear::load(ctx, w, &format!("{p}.attn_q"), dim, q_dim),
-                    wk: Linear::load(ctx, w, &format!("{p}.attn_k"), dim, kv_dim),
-                    wv: Linear::load(ctx, w, &format!("{p}.attn_v"), dim, kv_dim),
+                    wqkv: Linear::load_fused(
+                        ctx,
+                        w,
+                        dim,
+                        &[
+                            (&format!("{p}.attn_q"), q_dim),
+                            (&format!("{p}.attn_k"), kv_dim),
+                            (&format!("{p}.attn_v"), kv_dim),
+                        ],
+                    ),
                     wo: Linear::load(ctx, w, &format!("{p}.attn_output"), q_dim, dim),
                     q_norm: RmsNorm::load(ctx, w, &format!("{p}.attn_q_norm"), head_dim, eps, false),
                     k_norm: RmsNorm::load(ctx, w, &format!("{p}.attn_k_norm"), head_dim, eps, false),
@@ -131,9 +136,13 @@ impl Model for Qwen3 {
         for (i, l) in self.layers.iter().enumerate() {
             // ── attention sublayer ──
             let normed = l.attn_norm.forward(ctx, &hidden, 1);
-            let q = l.wq.forward(ctx, &normed, 1);
-            let k = l.wk.forward(ctx, &normed, 1);
-            let v = l.wv.forward(ctx, &normed, 1);
+            // One fused QKV matmul, then slice out q / k / v (cheap copies).
+            let q_dim = self.n_heads * self.head_dim;
+            let kv_dim = self.n_kv_heads * self.head_dim;
+            let qkv = l.wqkv.forward(ctx, &normed, 1);
+            let q = slice(ctx, &qkv, 0, q_dim);
+            let k = slice(ctx, &qkv, q_dim, kv_dim);
+            let v = slice(ctx, &qkv, q_dim + kv_dim, kv_dim);
 
             // per-head QK-Norm (each head's head_dim vector), then RoPE
             let q = l.q_norm.forward(ctx, &q, self.n_heads);
@@ -176,4 +185,11 @@ fn clone_buf(ctx: &GpuContext, src: &wgpu::Buffer, len: usize) -> wgpu::Buffer {
     // residual add with a zero buffer = a copy, using the existing kernel.
     let zero = ctx.storage(&vec![0.0f32; len]);
     attention::add(ctx, src, &zero, len)
+}
+
+/// Extract `[off .. off+len]` of `src` into a fresh buffer (a GPU copy).
+fn slice(ctx: &GpuContext, src: &wgpu::Buffer, off: usize, len: usize) -> wgpu::Buffer {
+    let out = ctx.empty(len);
+    ctx.copy(src, off, &out, 0, len);
+    out
 }
