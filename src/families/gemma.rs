@@ -1,22 +1,42 @@
-//! Gemma 2/3 — the family that exercises the kernel variants: the unit-shift
-//! RMSNorm gain (`1 + weight`) and GeGLU instead of SwiGLU. Also sliding-window
-//! attention on alternating layers and final-logit soft-capping (handled in the
-//! forward loop / sampler).
+//! Gemma 2/3 — exercises the variant kernels and a different layer shape:
+//! unit-shift RMSNorm (`1 + weight`), GeGLU, sliding-window attention, and
+//! *post*-sublayer norms (a second RMSNorm on each sublayer output before the
+//! residual add) in addition to the pre-norms. Final-logit soft-capping is a
+//! sampler-side scalar in `params`.
 
-use super::FamilySpec;
-use crate::kernels::{Activation, NormKind};
+use super::{Family, Params};
+use crate::arch::{Block::*, Mask::*, Proj::*};
 
-pub fn spec() -> FamilySpec {
-    FamilySpec {
+pub fn family() -> Family {
+    Family {
         name: "gemma",
-        norm: NormKind::UnitShift,
-        activation: Activation::GeGlu,
-        use_qk_norm: false,
-        attn_qkv_bias: false,
-        attn_o_bias: false,
-        tie_word_embeddings: true,
-        default_rope_theta: 10_000.0,
-        sliding_window: Some(4096),
-        final_logit_softcap: Some(30.0),
+        params: Params {
+            eps: 1e-6,
+            rope_theta: 10_000.0,
+            sliding_window: Some(4096),
+            final_logit_softcap: Some(30.0),
+        },
+        layer: vec![
+            // attention: pre-norm + sublayer + post-norm, then residual
+            ResidualSave,
+            RmsNormUnit,
+            Linear(Q),
+            Linear(K),
+            Linear(V),
+            Rope,
+            Attention(Sliding(4096)),
+            Linear(O),
+            RmsNormUnit, // <- Gemma post-norm
+            ResidualAdd,
+            // MLP: pre-norm + GeGLU sublayer + post-norm, then residual
+            ResidualSave,
+            RmsNormUnit,
+            Linear(Gate),
+            Linear(Up),
+            GeGlu,
+            Linear(Down),
+            RmsNormUnit, // <- Gemma post-norm
+            ResidualAdd,
+        ],
     }
 }

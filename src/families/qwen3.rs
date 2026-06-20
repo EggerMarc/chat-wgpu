@@ -1,21 +1,37 @@
-//! Qwen3 — the first bring-up target. Llama-shaped, but adds per-head QK-Norm
-//! (an RMSNorm on q and k before attention), no QKV bias, and ships tied
-//! embeddings (no `output.weight`).
+//! Qwen3 — Llama-shaped plus per-head QK-Norm (an RMSNorm on q and k after
+//! their projections, before RoPE). No QKV bias; tied embeddings; large RoPE
+//! base. The `QkNorm` block is the one structural addition over Llama.
 
-use super::FamilySpec;
-use crate::kernels::{Activation, NormKind};
+use super::{Family, Params};
+use crate::arch::{Block::*, Mask::*, Proj::*};
 
-pub fn spec() -> FamilySpec {
-    FamilySpec {
+pub fn family() -> Family {
+    Family {
         name: "qwen3",
-        norm: NormKind::Plain,
-        activation: Activation::SwiGlu,
-        use_qk_norm: true,
-        attn_qkv_bias: false,
-        attn_o_bias: false,
-        tie_word_embeddings: true,
-        default_rope_theta: 1_000_000.0,
-        sliding_window: None,
-        final_logit_softcap: None,
+        params: Params {
+            eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            sliding_window: None,
+            final_logit_softcap: None,
+        },
+        layer: vec![
+            ResidualSave,
+            RmsNorm,
+            Linear(Q),
+            Linear(K),
+            Linear(V),
+            QkNorm, // <- Qwen3 only
+            Rope,
+            Attention(Causal),
+            Linear(O),
+            ResidualAdd,
+            ResidualSave,
+            RmsNorm,
+            Linear(Gate),
+            Linear(Up),
+            SwiGlu,
+            Linear(Down),
+            ResidualAdd,
+        ],
     }
 }
