@@ -85,9 +85,28 @@ impl GpuContext {
         self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: (len * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
+    }
+
+    /// GPU→GPU copy of `len` f32s from `src[src_off..]` into `dst[dst_off..]`.
+    /// Used to write a new token's K/V into the preallocated KV cache, and to
+    /// gather an embedding row.
+    pub fn copy(&self, src: &wgpu::Buffer, src_off: usize, dst: &wgpu::Buffer, dst_off: usize, len: usize) {
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(
+            src,
+            (src_off * 4) as u64,
+            dst,
+            (dst_off * 4) as u64,
+            (len * 4) as u64,
+        );
+        self.queue.submit([enc.finish()]);
     }
 
     pub fn uniform(&self, bytes: &[u8]) -> wgpu::Buffer {

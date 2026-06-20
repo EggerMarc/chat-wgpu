@@ -8,7 +8,7 @@
 //! Each is its own `Model` impl over the shared components and kernels.
 
 use super::layers::{Linear, RmsNorm};
-use super::{Hook, Model, Weights};
+use super::{Hook, KvCache, Model, Weights};
 use crate::context::GpuContext;
 use crate::kernels::{activation, attention, rope};
 
@@ -29,6 +29,12 @@ struct Layer {
 pub struct Qwen3 {
     layers: Vec<Layer>,
     final_norm: RmsNorm,
+    /// Input embedding table, raw `[vocab, dim]` (row-major) for row gather.
+    embed: wgpu::Buffer,
+    /// LM head `[dim, vocab]` (the matmul operand). Tied to `embed` if the GGUF
+    /// ships no `output.weight`.
+    lm_head: Linear,
+    vocab: usize,
     dim: usize,
     hidden: usize,
     n_heads: usize,
@@ -47,6 +53,7 @@ impl Model for Qwen3 {
         let hidden = w.meta_u32("qwen3.feed_forward_length") as usize;
         let eps = w.meta_f32("qwen3.attention.layer_norm_rms_epsilon");
         let rope_theta = w.meta_f32("qwen3.rope.freq_base");
+        let vocab = w.meta_u32("qwen3.vocab_size") as usize;
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
 
@@ -69,9 +76,21 @@ impl Model for Qwen3 {
             })
             .collect();
 
+        // Embedding table raw `[vocab, dim]` for row gather; LM head transposed
+        // `[dim, vocab]`, tied to the embedding when `output.weight` is absent.
+        let embed = w.vector(ctx, "token_embd.weight", vocab * dim);
+        let lm_head = if w.has("output.weight") {
+            Linear::load(ctx, w, "output", dim, vocab)
+        } else {
+            Linear::load(ctx, w, "token_embd", dim, vocab)
+        };
+
         Ok(Self {
             layers,
             final_norm: RmsNorm::load(ctx, w, "output_norm", dim, eps, false),
+            embed,
+            lm_head,
+            vocab,
             dim,
             hidden,
             n_heads,
@@ -81,11 +100,31 @@ impl Model for Qwen3 {
         })
     }
 
+    fn new_cache(&self, ctx: &GpuContext, max_seq: usize) -> KvCache {
+        KvCache::new(ctx, self.layers.len(), self.n_kv_heads * self.head_dim, max_seq)
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab
+    }
+
+    fn embed(&self, ctx: &GpuContext, token: u32) -> wgpu::Buffer {
+        // Gather row `token` of the `[vocab, dim]` table.
+        let out = ctx.empty(self.dim);
+        ctx.copy(&self.embed, token as usize * self.dim, &out, 0, self.dim);
+        out
+    }
+
+    fn logits(&self, ctx: &GpuContext, hidden: &wgpu::Buffer) -> wgpu::Buffer {
+        self.lm_head.forward(ctx, hidden, 1)
+    }
+
     fn forward(
         &self,
         ctx: &GpuContext,
         x: &wgpu::Buffer,
         pos: usize,
+        cache: &mut KvCache,
         hook: &mut dyn Hook,
     ) -> wgpu::Buffer {
         let mut hidden = clone_buf(ctx, x, self.dim);
@@ -103,10 +142,17 @@ impl Model for Qwen3 {
             let k = rope::rope(ctx, &k, self.n_kv_heads, self.head_dim, pos, self.rope_theta);
             hook.tap("q", i, &q, self.n_heads * self.head_dim);
 
-            // decode attention over the single cached position (seq=1 here; the
-            // forward loop will thread a multi-position KV cache through `pos`)
+            // append this token's K/V to the cache, attend over the prefix
+            cache.write(ctx, i, pos, &k, &v);
             let attn = attention::attention(
-                ctx, &q, &k, &v, self.n_heads, self.n_kv_heads, 1, self.head_dim,
+                ctx,
+                &q,
+                cache.k(i),
+                cache.v(i),
+                self.n_heads,
+                self.n_kv_heads,
+                pos + 1,
+                self.head_dim,
             );
             let attn_out = l.wo.forward(ctx, &attn, 1);
             hidden = attention::add(ctx, &hidden, &attn_out, self.dim);

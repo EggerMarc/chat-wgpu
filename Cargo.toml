@@ -17,6 +17,11 @@ name = "verify"
 path = "src/main.rs"
 required-features = ["verify"]
 
+# Native end-to-end: load a real GGUF + tokenizer and generate text.
+[[example]]
+name = "generate"
+required-features = ["verify"]
+
 [dependencies]
 wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }

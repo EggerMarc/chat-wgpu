@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use chat_wgpu::context::GpuContext;
 use chat_wgpu::kernels::{activation, attention, matmul, norm, rope};
 use chat_wgpu::model::qwen3::Qwen3;
-use chat_wgpu::model::{Hook, Model, Weights};
+use chat_wgpu::model::{self, Hook, Model, Weights};
 
 fn main() {
     pollster::block_on(run());
@@ -135,22 +135,24 @@ async fn qwen3_forward(ctx: &GpuContext) {
         n_kv_heads: 2,
         head_dim: 16,
         hidden: 128,
+        vocab: 256,
     };
     let model = Qwen3::load(ctx, &mut weights).expect("load");
 
-    let x = ctx.storage(&fill(0xBEEF, 64)); // input embedding
+    // Greedy generation over the full pipeline: embed → layers + KV cache →
+    // lm-head → argmax → feed back. Random weights, so the tokens are gibberish;
+    // the point is the decode loop + cache run end-to-end on GPU.
+    let prompt = [1u32, 5, 9, 2];
     let mut cap = Capture::default();
-    let out = model.forward(ctx, &x, 3, &mut cap);
-
-    let o = ctx.read(&out, 64).await;
-    println!("qwen3 forward ran on GPU: final[0..4] = {:?}", &o[..4]);
+    let out = model::generate(ctx, &model, &prompt, 8, &mut cap).await;
+    println!("qwen3 generate (random weights): prompt {prompt:?} -> {out:?}");
 
     // Pull a mid-layer intermediate back out — the meta-ML use case.
     if let Some((buf, len)) = cap.get("post_attn", 0) {
         let mid = ctx.read(&buf, len).await;
         println!("tapped post_attn @layer0[0..4] = {:?}", &mid[..4]);
     }
-    println!("hook captured: {} intermediates", cap.taps.len());
+    println!("hook captured {} distinct tap points", cap.taps.len());
 }
 
 /// A `Hook` that stashes every tapped buffer (handles are cheap clones).
@@ -177,6 +179,7 @@ struct RandomWeights {
     n_kv_heads: usize,
     head_dim: usize,
     hidden: usize,
+    vocab: usize,
 }
 impl Weights for RandomWeights {
     fn meta_u32(&self, key: &str) -> u32 {
@@ -187,6 +190,7 @@ impl Weights for RandomWeights {
             k if k.ends_with("head_count") => self.n_heads,
             k if k.ends_with("key_length") => self.head_dim,
             k if k.ends_with("feed_forward_length") => self.hidden,
+            k if k.ends_with("vocab_size") => self.vocab,
             _ => 0,
         }) as u32
     }

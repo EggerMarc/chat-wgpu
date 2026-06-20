@@ -77,6 +77,59 @@ pub fn dequant_q4_0(bytes: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// Q4_1: blocks of 32 — f16 scale `d`, f16 min `m`, then 16 packed 4-bit quants;
+/// value = d·q + m (q in 0..15, no offset).
+pub fn dequant_q4_1(bytes: &[u8], n: usize) -> Vec<f32> {
+    const QK: usize = 32;
+    const BLK: usize = 4 + QK / 2; // 20 bytes
+    let mut out = vec![0f32; n];
+    for blk in 0..n / QK {
+        let base = blk * BLK;
+        let d = f16_to_f32(read_u16(bytes, base));
+        let m = f16_to_f32(read_u16(bytes, base + 2));
+        for j in 0..QK / 2 {
+            let byte = bytes[base + 4 + j];
+            out[blk * QK + j] = d * (byte & 0x0f) as f32 + m;
+            out[blk * QK + j + QK / 2] = d * (byte >> 4) as f32 + m;
+        }
+    }
+    out
+}
+
+/// Q6_K: k-quant super-blocks of 256 — 6-bit quants (4 low bits in `ql`, 2 high
+/// bits in `qh`), 16 int8 sub-block scales, one f16 super-block scale `d`.
+/// Layout matches ggml's `block_q6_K` (210 bytes).
+pub fn dequant_q6_k(bytes: &[u8], n: usize) -> Vec<f32> {
+    const QK: usize = 256;
+    const BLK: usize = 128 + 64 + 16 + 2;
+    let mut out = vec![0f32; n];
+    for blk in 0..n / QK {
+        let base = blk * BLK;
+        let ql = &bytes[base..base + 128];
+        let qh = &bytes[base + 128..base + 192];
+        let sc = &bytes[base + 192..base + 208]; // int8
+        let d = f16_to_f32(read_u16(bytes, base + 208));
+        let y = &mut out[blk * QK..blk * QK + QK];
+
+        for half in 0..2 {
+            let (qlo, qho, sco, yo) = (half * 64, half * 32, half * 8, half * 128);
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[qlo + l] & 0x0f) as i32 | (((qh[qho + l] >> 0) & 3) as i32) << 4) - 32;
+                let q2 = ((ql[qlo + l + 32] & 0x0f) as i32 | (((qh[qho + l] >> 2) & 3) as i32) << 4) - 32;
+                let q3 = ((ql[qlo + l] >> 4) as i32 | (((qh[qho + l] >> 4) & 3) as i32) << 4) - 32;
+                let q4 = ((ql[qlo + l + 32] >> 4) as i32 | (((qh[qho + l] >> 6) & 3) as i32) << 4) - 32;
+                let s = |i: usize| sc[sco + i] as i8 as f32;
+                y[yo + l] = d * s(is) * q1 as f32;
+                y[yo + l + 32] = d * s(is + 2) * q2 as f32;
+                y[yo + l + 64] = d * s(is + 4) * q3 as f32;
+                y[yo + l + 96] = d * s(is + 6) * q4 as f32;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +158,33 @@ mod tests {
         assert_eq!(out[0], 0.0);
         assert_eq!(out[1], 0.5);
         assert_eq!(out[10], 5.0);
+    }
+
+    #[test]
+    fn q4_1_block() {
+        // d = 1.0 (0x3c00), m = 0.5 (0x3800). q=0 -> 0.5; q=15 -> 15.5.
+        let mut b = vec![0x00, 0x3c, 0x00, 0x38];
+        for _ in 0..16 {
+            b.push(0x00 | (15 << 4)); // lo=0 (->0.5), hi=15 (->15.5)
+        }
+        let out = dequant_q4_1(&b, 32);
+        assert_eq!(out[0], 0.5);
+        assert_eq!(out[16], 15.5);
+    }
+
+    #[test]
+    fn q6_k_zero_quants() {
+        // All quants 0 -> dequant to -32*d*scale per element. With scales=1,
+        // d=1: every value = -32. (Validates block sizing + the -32 bias.)
+        let mut b = vec![0u8; 210];
+        for s in b.iter_mut().take(208).skip(192) {
+            *s = 1; // int8 scale = 1
+        }
+        b[208] = 0x00;
+        b[209] = 0x3c; // d = 1.0
+        let out = dequant_q6_k(&b, 256);
+        assert_eq!(out[0], -32.0);
+        assert_eq!(out[255], -32.0);
     }
 
     #[test]

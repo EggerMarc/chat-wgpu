@@ -12,9 +12,11 @@
 
 use crate::context::GpuContext;
 
+mod cache;
 mod layers;
 pub mod qwen3;
 
+pub use cache::KvCache;
 pub use layers::{Linear, RmsNorm};
 
 /// A loaded, runnable model. Concrete models (`qwen3::Qwen3`, …) implement it.
@@ -22,16 +24,73 @@ pub trait Model: Sized {
     /// Load weights onto a fresh instance from a weight source.
     fn load(ctx: &GpuContext, w: &mut dyn Weights) -> Result<Self, String>;
 
-    /// Forward one token: `x` is the input embedding (length = model dim) at
-    /// position `pos`; returns the final hidden state. Composes the architecture
-    /// from kernel building blocks and taps named intermediates through `hook`.
+    /// Allocate a KV cache sized for this model and a `max_seq` context.
+    fn new_cache(&self, ctx: &GpuContext, max_seq: usize) -> KvCache;
+
+    /// Vocabulary size (logits length).
+    fn vocab_size(&self) -> usize;
+
+    /// Input embedding for `token` (length = model dim).
+    fn embed(&self, ctx: &GpuContext, token: u32) -> wgpu::Buffer;
+
+    /// Forward one token at `pos`: `x` is the input embedding; the new K/V are
+    /// written into `cache` and attention reads the `pos+1` prefix. Returns the
+    /// final hidden state. Composes the architecture from kernel building blocks
+    /// and taps named intermediates through `hook`.
     fn forward(
         &self,
         ctx: &GpuContext,
         x: &wgpu::Buffer,
         pos: usize,
+        cache: &mut KvCache,
         hook: &mut dyn Hook,
     ) -> wgpu::Buffer;
+
+    /// Project a hidden state to vocabulary logits (`[vocab]`).
+    fn logits(&self, ctx: &GpuContext, hidden: &wgpu::Buffer) -> wgpu::Buffer;
+}
+
+/// Greedy generation: prefill the prompt, then decode `max_new` tokens by
+/// argmax. Reads logits back each step (a future on-device argmax avoids the
+/// sync). Returns the generated token ids.
+pub async fn generate<M: Model>(
+    ctx: &GpuContext,
+    model: &M,
+    prompt: &[u32],
+    max_new: usize,
+    hook: &mut dyn Hook,
+) -> Vec<u32> {
+    let mut cache = model.new_cache(ctx, prompt.len() + max_new);
+    let mut pos = 0usize;
+    let mut hidden = None;
+    for &t in prompt {
+        let x = model.embed(ctx, t);
+        hidden = Some(model.forward(ctx, &x, pos, &mut cache, hook));
+        pos += 1;
+    }
+
+    let vocab = model.vocab_size();
+    let mut produced = Vec::with_capacity(max_new);
+    for _ in 0..max_new {
+        let logits = model.logits(ctx, hidden.as_ref().unwrap());
+        let lv = ctx.read(&logits, vocab).await;
+        let next = argmax(&lv);
+        produced.push(next);
+        let x = model.embed(ctx, next);
+        hidden = Some(model.forward(ctx, &x, pos, &mut cache, hook));
+        pos += 1;
+    }
+    produced
+}
+
+fn argmax(v: &[f32]) -> u32 {
+    let mut best = 0;
+    for i in 1..v.len() {
+        if v[i] > v[best] {
+            best = i;
+        }
+    }
+    best as u32
 }
 
 /// Where a model pulls its weights + metadata from — a GGUF file in production,

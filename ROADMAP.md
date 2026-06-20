@@ -41,18 +41,23 @@ sampling for meta-ML). No config-flag struct.
 - [x] **`Model` trait + `Qwen3`** — load + forward composing the kernel building
       blocks, with intermediate `Hook` taps. Runs on GPU (random weights).
 - [x] **Weight loaders** (`Weights` trait): hand-written **GGUF** (binary parse,
-      metadata, dequant F32/F16/Q8_0/Q4_0, transpose) and **Safetensors** (JSON
-      header, F32/F16/BF16, `config.json` metadata, GGUF↔HF name translation).
-      Unit-tested (parse + dequant round-trips). No candle.
-- [ ] GGUF **k-quants** (Q4_K / Q6_K dequant) — to load the common `*-Q4_K_M`
-      files; today errors with a clear message.
-- [ ] **attention building block: KV cache** — thread a multi-position cache
-      through `pos` (today decode attends to seq=1).
-- [ ] **full forward** — embedding gather → N layers → final norm → lm-head →
-      sample; verify end-to-end vs chat-candle for the same weights/prompt.
+      metadata, dequant F32/F16/Q8_0/Q4_0/Q4_1/Q6_K, transpose) and
+      **Safetensors** (JSON header, F32/F16/BF16, `config.json` metadata, GGUF↔HF
+      name translation). Unit-tested. No candle.
+- [x] **KV cache** — preallocated per-layer GPU buffers; cache-aware attention.
+- [x] **full forward + generation** — embedding gather → N layers → final norm →
+      lm-head → greedy argmax → feedback. `model::generate`.
+- [x] **🎉 real Qwen3-0.6B generates coherent text** end-to-end on Metal
+      (`cargo run --release --example generate`). ~2 tok/s on the naive kernels.
+- [ ] GGUF **Q4_K / Q5_K** dequant — to load the common `*-Q4_K_M` files (Q6_K
+      already done).
 - [ ] **Llama / Gemma** model impls — prove the components + kernels compose
       (Llama = Qwen3 minus QK-Norm; Gemma swaps norm/activation + post-norms).
-- [ ] **sampling** — greedy + temp/top-k/top-p (on-device argmax where possible).
+- [ ] **sampling** — temp/top-k/top-p, on-device argmax (avoid the per-token
+      logits readback).
+- [ ] **perf** — the kernels are one-thread-per-row/element for correctness;
+      tiled GEMM + flash attention + q4-in-VRAM dequant-matmul are the levers
+      (the spike measured ~5–49× headroom).
 
 ## 3. Browser API
 

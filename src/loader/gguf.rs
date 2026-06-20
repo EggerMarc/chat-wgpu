@@ -10,16 +10,20 @@ use crate::context::GpuContext;
 use crate::model::Weights;
 
 /// A parsed metadata value (only the kinds models ask for are kept typed).
+/// `Str` is retained so string metadata parses correctly (cursor advance); a
+/// `meta_str` accessor lands with GGUF-driven model auto-detection.
 #[derive(Clone, Debug)]
 enum Meta {
     U(u64),
     F(f64),
+    #[allow(dead_code)]
     Str(String),
     Other,
 }
 
 struct TensorInfo {
     dtype: u32,
+    dims: Vec<usize>,
     n_elems: usize,
     /// Byte offset into the data blob.
     offset: usize,
@@ -86,7 +90,8 @@ impl GgufWeights {
             let dtype = c.u32();
             let offset = c.u64() as usize;
             let n_elems = dims.iter().product::<u64>() as usize;
-            infos.push((name, TensorInfo { dtype, n_elems, offset }));
+            let dims = dims.iter().map(|&d| d as usize).collect();
+            infos.push((name, TensorInfo { dtype, dims, n_elems, offset }));
         }
 
         // Tensor data begins at the next `alignment` boundary after the header.
@@ -110,8 +115,10 @@ impl GgufWeights {
             0 => dequant::dequant_f32(b, n),
             1 => dequant::dequant_f16(b, n),
             2 => dequant::dequant_q4_0(b, n),
+            3 => dequant::dequant_q4_1(b, n),
             8 => dequant::dequant_q8_0(b, n),
-            d => return Err(format!("tensor {name}: ggml dtype {d} not supported yet (k-quants todo)")),
+            14 => dequant::dequant_q6_k(b, n),
+            d => return Err(format!("tensor {name}: ggml dtype {d} not supported yet")),
         })
     }
 }
@@ -158,10 +165,18 @@ fn skip_scalar(c: &mut Cur, t: u32) {
 impl Weights for GgufWeights {
     fn meta_u32(&self, key: &str) -> u32 {
         match self.meta.get(key) {
-            Some(Meta::U(v)) => *v as u32,
-            Some(Meta::F(v)) => *v as u32,
-            _ => 0,
+            Some(Meta::U(v)) => return *v as u32,
+            Some(Meta::F(v)) => return *v as u32,
+            _ => {}
         }
+        // Fallback: vocab size from the embedding table's larger dimension when
+        // the GGUF doesn't carry an explicit `{arch}.vocab_size`.
+        if key.ends_with("vocab_size") {
+            if let Some(t) = self.tensors.get("token_embd.weight") {
+                return t.dims.iter().copied().max().unwrap_or(0) as u32;
+            }
+        }
+        0
     }
     fn meta_f32(&self, key: &str) -> f32 {
         match self.meta.get(key) {
