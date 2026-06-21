@@ -21,6 +21,7 @@ pub fn rope(
     u[12..16].copy_from_slice(&theta.to_le_bytes());
     let dims_buf = ctx.uniform(&u);
     let pipeline = ctx.pipeline("rope", WGSL, "main");
-    ctx.run(&pipeline, &[x, &y, &dims_buf], ((rows as u32).div_ceil(64), 1, 1));
+    // Uniform carries `pos` (varies per token) → can't use the bind-group cache.
+    ctx.run_uncached(&pipeline, &[x, &y, &dims_buf], ((rows as u32).div_ceil(64), 1, 1));
     y
 }

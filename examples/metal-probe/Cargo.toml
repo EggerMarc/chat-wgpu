@@ -1,0 +1,12 @@
+[package]
+name = "metal-probe"
+version = "0.0.0"
+edition = "2021"
+description = "Measure Metal per-dispatch overhead: many command buffers vs one encoder (+barriers) — the wgpu-vs-MLX ceiling test."
+
+[[bin]]
+name = "metal-probe"
+path = "src/main.rs"
+
+[dependencies]
+metal = "0.29"

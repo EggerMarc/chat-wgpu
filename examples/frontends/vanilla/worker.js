@@ -52,7 +52,9 @@ self.onmessage = async (e) => {
       const tok = await fetchBytes(msg.tokenizerUrl, "tokenizer");
       const gguf = await fetchBytes(msg.ggufUrl, "weights");
       post({ type: "status", status: "loading", detail: "building model" });
-      chat = await LocalChat.create(gguf, tok); // async: requests the GPU device
+      // quantize=true: keep weights q4-packed in VRAM — 4× smaller, and the
+      // dense f32 weights don't fit under WebGPU's buffer caps anyway.
+      chat = await LocalChat.create(gguf, tok, true);
       post({ type: "ready" });
     } else if (msg.type === "generate") {
       if (!chat) throw new Error("model not loaded");

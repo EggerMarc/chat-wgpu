@@ -11,20 +11,23 @@ use chat_wgpu::model::{self, Model};
 use tokenizers::Tokenizer;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    // Filter out a `--quantize` flag, then take positional args.
+    let mut args: Vec<String> = std::env::args().collect();
+    let quantize = args.iter().any(|a| a == "--quantize");
+    args.retain(|a| a != "--quantize");
     if args.len() < 4 {
-        eprintln!("usage: generate <model.gguf> <tokenizer.json> <prompt> [max_new]");
+        eprintln!("usage: generate <model.gguf> <tokenizer.json> <prompt> [max_new] [--quantize]");
         std::process::exit(2);
     }
-    let gguf_path = &args[1];
-    let tok_path = &args[2];
-    let prompt = &args[3];
+    let gguf_path = args[1].clone();
+    let tok_path = args[2].clone();
+    let prompt = args[3].clone();
     let max_new: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(32);
 
-    pollster::block_on(run(gguf_path, tok_path, prompt, max_new));
+    pollster::block_on(run(&gguf_path, &tok_path, &prompt, max_new, quantize));
 }
 
-async fn run(gguf_path: &str, tok_path: &str, prompt: &str, max_new: usize) {
+async fn run(gguf_path: &str, tok_path: &str, prompt: &str, max_new: usize, quantize: bool) {
     let ctx = GpuContext::new().await.expect("gpu");
     eprintln!("[info] backend: {}", ctx.backend);
 
@@ -35,9 +38,12 @@ async fn run(gguf_path: &str, tok_path: &str, prompt: &str, max_new: usize) {
     eprintln!("[info] parsing GGUF ({} MB)", bytes.len() / 1_000_000);
     let mut weights = GgufWeights::parse(bytes).expect("parse gguf");
 
-    eprintln!("[info] loading model (dequantizing weights to f32 on GPU)…");
+    eprintln!(
+        "[info] loading model ({})…",
+        if quantize { "q4-packed in VRAM" } else { "dense f32" }
+    );
     let t0 = std::time::Instant::now();
-    let model = Qwen3::load(&ctx, &mut weights).expect("load model");
+    let model = Qwen3::load(&ctx, &mut weights, quantize).expect("load model");
     eprintln!("[info] model ready in {:.1}s", t0.elapsed().as_secs_f64());
 
     // Qwen3 ChatML prompt.

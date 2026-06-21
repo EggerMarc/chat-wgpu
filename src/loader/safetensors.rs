@@ -141,6 +141,10 @@ impl Weights for SafetensorsWeights {
         }
         b
     }
+    fn matrix_raw(&mut self, name: &str, _out_f: usize, _in_f: usize) -> Vec<f32> {
+        // HF stores [out, in] row-major — already the native orientation.
+        self.tensor_f32(&to_hf(name)).expect("tensor")
+    }
     fn vector_data(&mut self, name: &str, _len: usize) -> Vec<f32> {
         self.tensor_f32(&to_hf(name)).expect("tensor")
     }

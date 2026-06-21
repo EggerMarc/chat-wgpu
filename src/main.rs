@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use chat_wgpu::context::GpuContext;
-use chat_wgpu::kernels::{activation, attention, matmul, norm, rope};
+use chat_wgpu::kernels::{activation, attention, matmul, norm, q4, rope};
 use chat_wgpu::model::qwen3::Qwen3;
 use chat_wgpu::model::{self, Hook, Model, Weights};
 
@@ -35,6 +35,7 @@ async fn run() {
     fails += rope_pos0(&ctx).await;
     fails += attention_single_key(&ctx).await;
     fails += ewise_add(&ctx).await;
+    fails += q4_gemv(&ctx).await;
 
     println!();
     qwen3_forward(&ctx).await;
@@ -116,6 +117,40 @@ async fn attention_single_key(ctx: &GpuContext) -> u32 {
     report("attention seq=1=V", &ctx.read(&out, n_heads * head_dim).await, &expect)
 }
 
+/// q4 GEMV vs an f32 reference on the same (re-quantized) weights. Random
+/// weights, so we compare the q4 result to a CPU dequant-and-dot of the *same*
+/// quantized values — exact, isolating the kernel from quantization error.
+async fn q4_gemv(ctx: &GpuContext) -> u32 {
+    let (in_f, out_f) = (256usize, 512usize);
+    let x = fill(0x1234, in_f);
+    let w = fill(0x5678, out_f * in_f); // [out, in]
+    let (scales, quants) = q4::quantize_q4_0(&w, out_f, in_f);
+    let sb = ctx.storage(&scales);
+    let qb = ctx.storage_u32(&quants);
+    let xb = ctx.storage(&x);
+    let got = ctx.read(&q4::gemv(ctx, &xb, &sb, &qb, in_f, out_f), out_f).await;
+
+    // CPU reference: dequant the same q4 blocks and dot.
+    let nblocks = in_f / 32;
+    let mut expect = vec![0f32; out_f];
+    for o in 0..out_f {
+        let mut sum = 0f32;
+        for b in 0..nblocks {
+            let d = scales[o * nblocks + b];
+            for w in 0..4 {
+                let word = quants[o * (in_f / 8) + b * 4 + w];
+                for n in 0..8 {
+                    let q = (word >> (n * 4)) & 0xF;
+                    let k = b * 32 + w * 8 + n;
+                    sum += d * (q as f32 - 8.0) * x[k];
+                }
+            }
+        }
+        expect[o] = sum;
+    }
+    report("q4::gemv", &got, &expect)
+}
+
 async fn ewise_add(ctx: &GpuContext) -> u32 {
     let n = 1000usize;
     let a: Vec<f32> = (0..n).map(|i| i as f32).collect();
@@ -137,7 +172,7 @@ async fn qwen3_forward(ctx: &GpuContext) {
         hidden: 128,
         vocab: 256,
     };
-    let model = Qwen3::load(ctx, &mut weights).expect("load");
+    let model = Qwen3::load(ctx, &mut weights, false).expect("load");
 
     // Greedy generation over the full pipeline: embed → layers + KV cache →
     // lm-head → argmax → feed back. Random weights, so the tokens are gibberish;
@@ -206,6 +241,9 @@ impl Weights for RandomWeights {
     }
     fn matrix_data(&mut self, name: &str, in_f: usize, out_f: usize) -> Vec<f32> {
         fill(seed(name), in_f * out_f)
+    }
+    fn matrix_raw(&mut self, name: &str, out_f: usize, in_f: usize) -> Vec<f32> {
+        fill(seed(name), out_f * in_f)
     }
     fn vector_data(&mut self, name: &str, len: usize) -> Vec<f32> {
         fill(seed(name), len)

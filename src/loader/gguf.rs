@@ -198,6 +198,10 @@ impl Weights for GgufWeights {
         }
         b
     }
+    fn matrix_raw(&mut self, name: &str, _out_f: usize, _in_f: usize) -> Vec<f32> {
+        // GGUF stores [out, in] row-major — already the native orientation.
+        self.tensor_f32(name).expect("tensor")
+    }
     fn vector_data(&mut self, name: &str, _len: usize) -> Vec<f32> {
         self.tensor_f32(name).expect("tensor")
     }

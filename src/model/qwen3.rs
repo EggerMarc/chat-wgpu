@@ -7,21 +7,23 @@
 //! lines; Gemma swaps the norm/activation building blocks and adds post-norms.
 //! Each is its own `Model` impl over the shared components and kernels.
 
-use super::layers::{Linear, RmsNorm};
+use super::layers::{Proj, RmsNorm};
 use super::{Hook, KvCache, Model, Weights};
 use crate::context::GpuContext;
 use crate::kernels::{activation, attention, rope};
 
 struct Layer {
     attn_norm: RmsNorm,
-    wqkv: Linear, // fused q/k/v projection (one wide GEMV instead of three)
-    wo: Linear,
+    wq: Proj,
+    wk: Proj,
+    wv: Proj,
+    wo: Proj,
     q_norm: RmsNorm, // per-head QK-Norm — the Qwen3 distinctive
     k_norm: RmsNorm,
     ffn_norm: RmsNorm,
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    gate: Proj,
+    up: Proj,
+    down: Proj,
 }
 
 pub struct Qwen3 {
@@ -29,9 +31,9 @@ pub struct Qwen3 {
     final_norm: RmsNorm,
     /// Input embedding table, raw `[vocab, dim]` (row-major) for row gather.
     embed: wgpu::Buffer,
-    /// LM head `[dim, vocab]` (the matmul operand). Tied to `embed` if the GGUF
-    /// ships no `output.weight`.
-    lm_head: Linear,
+    /// LM head `[dim, vocab]`. Tied to `embed` if the GGUF ships no
+    /// `output.weight`.
+    lm_head: Proj,
     vocab: usize,
     dim: usize,
     hidden: usize,
@@ -42,7 +44,7 @@ pub struct Qwen3 {
 }
 
 impl Model for Qwen3 {
-    fn load(ctx: &GpuContext, w: &mut dyn Weights) -> Result<Self, String> {
+    fn load(ctx: &GpuContext, w: &mut dyn Weights, quantize: bool) -> Result<Self, String> {
         let n_layers = w.meta_u32("qwen3.block_count") as usize;
         let dim = w.meta_u32("qwen3.embedding_length") as usize;
         let n_heads = w.meta_u32("qwen3.attention.head_count") as usize;
@@ -60,23 +62,16 @@ impl Model for Qwen3 {
                 let p = format!("blk.{i}");
                 Layer {
                     attn_norm: RmsNorm::load(ctx, w, &format!("{p}.attn_norm"), dim, eps, false),
-                    wqkv: Linear::load_fused(
-                        ctx,
-                        w,
-                        dim,
-                        &[
-                            (&format!("{p}.attn_q"), q_dim),
-                            (&format!("{p}.attn_k"), kv_dim),
-                            (&format!("{p}.attn_v"), kv_dim),
-                        ],
-                    ),
-                    wo: Linear::load(ctx, w, &format!("{p}.attn_output"), q_dim, dim),
+                    wq: Proj::load(ctx, w, quantize, &format!("{p}.attn_q"), dim, q_dim),
+                    wk: Proj::load(ctx, w, quantize, &format!("{p}.attn_k"), dim, kv_dim),
+                    wv: Proj::load(ctx, w, quantize, &format!("{p}.attn_v"), dim, kv_dim),
+                    wo: Proj::load(ctx, w, quantize, &format!("{p}.attn_output"), q_dim, dim),
                     q_norm: RmsNorm::load(ctx, w, &format!("{p}.attn_q_norm"), head_dim, eps, false),
                     k_norm: RmsNorm::load(ctx, w, &format!("{p}.attn_k_norm"), head_dim, eps, false),
                     ffn_norm: RmsNorm::load(ctx, w, &format!("{p}.ffn_norm"), dim, eps, false),
-                    gate: Linear::load(ctx, w, &format!("{p}.ffn_gate"), dim, hidden),
-                    up: Linear::load(ctx, w, &format!("{p}.ffn_up"), dim, hidden),
-                    down: Linear::load(ctx, w, &format!("{p}.ffn_down"), hidden, dim),
+                    gate: Proj::load(ctx, w, quantize, &format!("{p}.ffn_gate"), dim, hidden),
+                    up: Proj::load(ctx, w, quantize, &format!("{p}.ffn_up"), dim, hidden),
+                    down: Proj::load(ctx, w, quantize, &format!("{p}.ffn_down"), hidden, dim),
                 }
             })
             .collect();
@@ -84,11 +79,8 @@ impl Model for Qwen3 {
         // Embedding table raw `[vocab, dim]` for row gather; LM head transposed
         // `[dim, vocab]`, tied to the embedding when `output.weight` is absent.
         let embed = w.vector(ctx, "token_embd.weight", vocab * dim);
-        let lm_head = if w.has("output.weight") {
-            Linear::load(ctx, w, "output", dim, vocab)
-        } else {
-            Linear::load(ctx, w, "token_embd", dim, vocab)
-        };
+        let lm_name = if w.has("output.weight") { "output" } else { "token_embd" };
+        let lm_head = Proj::load(ctx, w, quantize, lm_name, dim, vocab);
 
         Ok(Self {
             layers,
@@ -121,7 +113,7 @@ impl Model for Qwen3 {
     }
 
     fn logits(&self, ctx: &GpuContext, hidden: &wgpu::Buffer) -> wgpu::Buffer {
-        self.lm_head.forward(ctx, hidden, 1)
+        self.lm_head.forward(ctx, hidden)
     }
 
     fn forward(
@@ -137,12 +129,9 @@ impl Model for Qwen3 {
             // ── attention sublayer ──
             let normed = l.attn_norm.forward(ctx, &hidden, 1);
             // One fused QKV matmul, then slice out q / k / v (cheap copies).
-            let q_dim = self.n_heads * self.head_dim;
-            let kv_dim = self.n_kv_heads * self.head_dim;
-            let qkv = l.wqkv.forward(ctx, &normed, 1);
-            let q = slice(ctx, &qkv, 0, q_dim);
-            let k = slice(ctx, &qkv, q_dim, kv_dim);
-            let v = slice(ctx, &qkv, q_dim + kv_dim, kv_dim);
+            let q = l.wq.forward(ctx, &normed);
+            let k = l.wk.forward(ctx, &normed);
+            let v = l.wv.forward(ctx, &normed);
 
             // per-head QK-Norm (each head's head_dim vector), then RoPE
             let q = l.q_norm.forward(ctx, &q, self.n_heads);
@@ -163,16 +152,20 @@ impl Model for Qwen3 {
                 pos + 1,
                 self.head_dim,
             );
-            let attn_out = l.wo.forward(ctx, &attn, 1);
+            let attn_out = l.wo.forward(ctx, &attn);
             hidden = attention::add(ctx, &hidden, &attn_out, self.dim);
             hook.tap("post_attn", i, &hidden, self.dim);
 
             // ── MLP sublayer (SwiGLU) ──
+            // (A whole-MLP megakernel was tested — see kernels/mlp_mega — and is
+            // *slower* for decode: one token forces one workgroup, ~1% GPU
+            // occupancy. Separate full-occupancy matmuls win despite the
+            // inter-pass barriers.)
             let normed = l.ffn_norm.forward(ctx, &hidden, 1);
-            let gate = l.gate.forward(ctx, &normed, 1);
-            let up = l.up.forward(ctx, &normed, 1);
+            let gate = l.gate.forward(ctx, &normed);
+            let up = l.up.forward(ctx, &normed);
             let act = activation::swiglu(ctx, &gate, &up, self.hidden);
-            let ff = l.down.forward(ctx, &act, 1);
+            let ff = l.down.forward(ctx, &act);
             hidden = attention::add(ctx, &hidden, &ff, self.dim);
             hook.tap("layer_out", i, &hidden, self.dim);
         }
@@ -187,9 +180,3 @@ fn clone_buf(ctx: &GpuContext, src: &wgpu::Buffer, len: usize) -> wgpu::Buffer {
     attention::add(ctx, src, &zero, len)
 }
 
-/// Extract `[off .. off+len]` of `src` into a fresh buffer (a GPU copy).
-fn slice(ctx: &GpuContext, src: &wgpu::Buffer, off: usize, len: usize) -> wgpu::Buffer {
-    let out = ctx.empty(len);
-    ctx.copy(src, off, &out, 0, len);
-    out
-}

@@ -12,7 +12,8 @@ pub struct KvCache {
 
 impl KvCache {
     pub fn new(ctx: &GpuContext, n_layers: usize, kv_dim: usize, max_seq: usize) -> Self {
-        let alloc = || (0..n_layers).map(|_| ctx.empty(max_seq * kv_dim)).collect();
+        // Persistent across tokens — must not be pooled/recycled.
+        let alloc = || (0..n_layers).map(|_| ctx.empty_persistent(max_seq * kv_dim)).collect();
         Self { k: alloc(), v: alloc(), kv_dim }
     }
 

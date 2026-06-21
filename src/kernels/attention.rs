@@ -29,7 +29,9 @@ pub fn attention(
     u[16..20].copy_from_slice(&scale.to_le_bytes());
     let dims_buf = ctx.uniform(&u);
     let pipeline = ctx.pipeline("attention", ATTN_WGSL, "main");
-    ctx.run(&pipeline, &[q, k, v, &out, &dims_buf], ((n_heads as u32).div_ceil(64), 1, 1));
+    // Uniform carries the cache length (grows each token) → uncached. Also the
+    // K/V buffers are the cache, fixed objects, so only the uniform varies.
+    ctx.run_uncached(&pipeline, &[q, k, v, &out, &dims_buf], ((n_heads as u32).div_ceil(64), 1, 1));
     out
 }
 

@@ -17,12 +17,13 @@ mod layers;
 pub mod qwen3;
 
 pub use cache::KvCache;
-pub use layers::{Linear, RmsNorm};
+pub use layers::{Linear, Proj, RmsNorm};
 
 /// A loaded, runnable model. Concrete models (`qwen3::Qwen3`, …) implement it.
 pub trait Model: Sized {
-    /// Load weights onto a fresh instance from a weight source.
-    fn load(ctx: &GpuContext, w: &mut dyn Weights) -> Result<Self, String>;
+    /// Load weights onto a fresh instance. `quantize` keeps matmul weights
+    /// q4-packed in VRAM (smaller, faster decode) instead of dense f32.
+    fn load(ctx: &GpuContext, w: &mut dyn Weights, quantize: bool) -> Result<Self, String>;
 
     /// Allocate a KV cache sized for this model and a `max_seq` context.
     fn new_cache(&self, ctx: &GpuContext, max_seq: usize) -> KvCache;
@@ -60,27 +61,49 @@ pub async fn generate<M: Model>(
     max_new: usize,
     hook: &mut dyn Hook,
 ) -> Vec<u32> {
+    ctx.clear_cache(); // fresh program: drop any cache from prior kernels
     let mut cache = model.new_cache(ctx, prompt.len() + max_new);
-    let mut pos = 0usize;
-    let mut hidden = None;
-    for &t in prompt {
-        let x = model.embed(ctx, t);
-        hidden = Some(model.forward(ctx, &x, pos, &mut cache, hook));
-        ctx.flush(); // one command buffer per token
-        pos += 1;
-    }
-
     let vocab = model.vocab_size();
+    let total = prompt.len() + max_new;
     let mut produced = Vec::with_capacity(max_new);
-    for _ in 0..max_new {
-        let logits = model.logits(ctx, hidden.as_ref().unwrap());
-        let lv = ctx.read(&logits, vocab).await; // flushes the lm-head batch
-        let next = argmax(&lv);
-        produced.push(next);
-        let x = model.embed(ctx, next);
-        hidden = Some(model.forward(ctx, &x, pos, &mut cache, hook));
-        ctx.flush();
-        pos += 1;
+    let mut next_input = prompt[0];
+
+    // One unified step per token (prompt *and* generated): reset the frame →
+    // embed → forward → lm-head → read. The op sequence is identical every step,
+    // so the bind-group cache stays aligned across tokens. (During the prompt
+    // the logits are just discarded.)
+    for pos in 0..total {
+        ctx.reset_frame();
+        // PROFILE: split CPU-record (all the ctx.run calls) from GPU+sync (read).
+        #[cfg(not(target_arch = "wasm32"))]
+        let t0 = std::time::Instant::now();
+        let x = model.embed(ctx, next_input);
+        let hidden = model.forward(ctx, &x, pos, &mut cache, hook);
+        let logits = model.logits(ctx, &hidden);
+        #[cfg(not(target_arch = "wasm32"))]
+        let t_rec = t0.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(not(target_arch = "wasm32"))]
+        let t1 = std::time::Instant::now();
+        let lv = ctx.read(&logits, vocab).await; // flush + GPU sync
+        #[cfg(not(target_arch = "wasm32"))]
+        if pos >= prompt.len() && pos < prompt.len() + 4 {
+            eprintln!(
+                "[profile] token {}: record(CPU)={:.1}ms  read(GPU+sync)={:.1}ms",
+                pos - prompt.len(),
+                t_rec,
+                t1.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let tok = argmax(&lv);
+        if pos + 1 < prompt.len() {
+            next_input = prompt[pos + 1];
+        } else {
+            produced.push(tok);
+            next_input = tok;
+            if produced.len() >= max_new {
+                break;
+            }
+        }
     }
     produced
 }
@@ -107,6 +130,9 @@ pub trait Weights {
     /// loader transposes GGUF's `[out, in]` and dequantizes.) Host-side so it can
     /// be concatenated (fused QKV / gate-up) before upload.
     fn matrix_data(&mut self, name: &str, in_f: usize, out_f: usize) -> Vec<f32>;
+    /// A weight matrix in its **native** `[out_f, in_f]` orientation (no
+    /// transpose) — what the q4 row-quantizer blocks along.
+    fn matrix_raw(&mut self, name: &str, out_f: usize, in_f: usize) -> Vec<f32>;
     /// A weight vector of length `len` host data (norm gains, biases).
     fn vector_data(&mut self, name: &str, len: usize) -> Vec<f32>;
 

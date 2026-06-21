@@ -21,7 +21,9 @@
 pub mod activation;
 pub mod attention;
 pub mod matmul;
+pub mod mlp_mega;
 pub mod norm;
+pub mod q4;
 pub mod rope;
 
 pub use matmul::matmul;

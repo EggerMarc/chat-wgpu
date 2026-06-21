@@ -35,10 +35,14 @@ pub struct LocalChat {
 impl LocalChat {
     /// Build from quantized GGUF bytes + `tokenizer.json` bytes. Async: requests
     /// the WebGPU device and dequantizes/uploads the weights.
-    pub async fn create(gguf: Vec<u8>, tokenizer_json: Vec<u8>) -> Result<LocalChat, JsValue> {
+    pub async fn create(
+        gguf: Vec<u8>,
+        tokenizer_json: Vec<u8>,
+        quantize: bool,
+    ) -> Result<LocalChat, JsValue> {
         let ctx = GpuContext::new().await.map_err(err)?;
         let mut weights = GgufWeights::parse(gguf).map_err(err)?;
-        let model = Qwen3::load(&ctx, &mut weights).map_err(err)?;
+        let model = Qwen3::load(&ctx, &mut weights, quantize).map_err(err)?;
         let tokenizer = Tokenizer::from_bytes(&tokenizer_json).map_err(err)?;
 
         let eos = ["<|im_end|>", "<|endoftext|>"]
