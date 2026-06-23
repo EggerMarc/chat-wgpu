@@ -17,7 +17,8 @@ fn run(ctx: &GpuContext, entry: &'static str, x: &wgpu::Buffer, w: &wgpu::Buffer
     let y = ctx.empty(rows * dim);
     let dims_buf = ctx.uniform(&dims(rows, dim, eps));
     let pipeline = ctx.pipeline(entry, WGSL, entry);
-    ctx.run(&pipeline, &[x, w, &y, &dims_buf], ((rows as u32).div_ceil(64), 1, 1));
+    // One workgroup (= one 32-lane subgroup) per row. See norm.wgsl.
+    ctx.run(&pipeline, &[x, w, &y, &dims_buf], (rows as u32, 1, 1));
     y
 }
 
