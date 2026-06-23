@@ -19,6 +19,7 @@
 //! Convention: buffers bind at sequential `@binding` 0.., a uniform last.
 
 pub mod activation;
+pub mod argmax;
 pub mod attention;
 pub mod matmul;
 pub mod mlp_mega;

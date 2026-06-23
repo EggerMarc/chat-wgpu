@@ -97,7 +97,10 @@ pub async fn generate<M: Model>(
         let t_record_ms = t0.elapsed().as_secs_f64() * 1000.0;
         #[cfg(not(target_arch = "wasm32"))]
         let t_gpu = std::time::Instant::now();
-        let lv = ctx.read(&logits, vocab).await; // flush + GPU sync
+        // On-device argmax → read back a single u32 (the f32 readback
+        // reinterprets the bytes), instead of the whole [vocab] logits vector.
+        let idx_buf = crate::kernels::argmax::argmax(ctx, &logits, vocab);
+        let tok = ctx.read(&idx_buf, 1).await[0].to_bits(); // flush + GPU sync
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(i) = decode_idx.filter(|&i| i < 4) {
             eprintln!(
@@ -108,7 +111,6 @@ pub async fn generate<M: Model>(
         if profiling {
             crate::profile::print_report(&ctx.report_profile().await);
         }
-        let tok = argmax(&lv);
         if pos + 1 < prompt.len() {
             next_input = prompt[pos + 1];
         } else {
@@ -120,16 +122,6 @@ pub async fn generate<M: Model>(
         }
     }
     produced
-}
-
-fn argmax(v: &[f32]) -> u32 {
-    let mut best = 0;
-    for i in 1..v.len() {
-        if v[i] > v[best] {
-            best = i;
-        }
-    }
-    best as u32
 }
 
 /// Where a model pulls its weights + metadata from — a GGUF file in production,
