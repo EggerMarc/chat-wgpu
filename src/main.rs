@@ -130,7 +130,7 @@ async fn q4_gemv(ctx: &GpuContext) -> u32 {
     let xb = ctx.storage(&x);
     let got = ctx.read(&q4::gemv(ctx, &xb, &sb, &qb, in_f, out_f), out_f).await;
 
-    // CPU reference: dequant the same q4 blocks and dot.
+    // CPU reference: dequant the same q4 blocks (block-along-in) and dot.
     let nblocks = in_f / 32;
     let mut expect = vec![0f32; out_f];
     for o in 0..out_f {

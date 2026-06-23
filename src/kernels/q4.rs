@@ -15,8 +15,8 @@ pub fn gemv(
     out_f: usize,
 ) -> wgpu::Buffer {
     let out = ctx.empty(out_f);
-    // One workgroup (64 threads) per output row, grid tiled across x/y since the
-    // dispatch dimension caps at 65535.
+    // One subgroup (32 lanes) per output row; grid tiled across x/y since the
+    // dispatch dimension caps at 65535 (out_f reaches the vocab size).
     let grid_x = (out_f as u32).min(65535);
     let grid_y = (out_f as u32).div_ceil(grid_x);
     let dims = [in_f as u32, out_f as u32, grid_x, 0u32];
@@ -26,22 +26,23 @@ pub fn gemv(
     out
 }
 
-/// Re-quantize a row-major `[rows, cols]` f32 matrix to Q4_0-style blocks of 32
-/// along `cols`: per block a single f32 scale `d = absmax/8`, and 4-bit quants
-/// `q = round(v/d)+8`. Returns `(scales[rows*cols/32], quants[rows*cols/8])`
-/// (8 nibbles per u32). `cols` must be a multiple of 32.
-pub fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> (Vec<f32>, Vec<u32>) {
-    assert!(cols % 32 == 0, "q4 expects cols multiple of 32");
-    let nblocks = cols / 32;
-    let mut scales = vec![0f32; rows * nblocks];
-    let mut quants = vec![0u32; rows * (cols / 8)];
-    for r in 0..rows {
+/// Re-quantize a native `[out_f, in_f]` f32 weight to Q4_0-style blocks of 32
+/// along `in_f`: per block a single f32 scale `d = absmax/8`, and 4-bit quants
+/// `q = round(v/d)+8`. Each output row is contiguous (so the GEMV workgroup
+/// streams it coalesced). Returns `(scales[out_f*in_f/32], quants[out_f*in_f/8])`
+/// (8 nibbles per u32). `in_f` must be a multiple of 32.
+pub fn quantize_q4_0(data: &[f32], out_f: usize, in_f: usize) -> (Vec<f32>, Vec<u32>) {
+    assert!(in_f % 32 == 0, "q4 expects in_f multiple of 32");
+    let nblocks = in_f / 32;
+    let mut scales = vec![0f32; out_f * nblocks];
+    let mut quants = vec![0u32; out_f * (in_f / 8)];
+    for o in 0..out_f {
         for b in 0..nblocks {
-            let base = r * cols + b * 32;
+            let base = o * in_f + b * 32;
             let absmax = (0..32).fold(0f32, |m, j| m.max(data[base + j].abs()));
             let d = absmax / 8.0;
             let inv = if d != 0.0 { 1.0 / d } else { 0.0 };
-            scales[r * nblocks + b] = d;
+            scales[o * nblocks + b] = d;
             for w in 0..4 {
                 let mut word = 0u32;
                 for n in 0..8 {
@@ -49,7 +50,7 @@ pub fn quantize_q4_0(data: &[f32], rows: usize, cols: usize) -> (Vec<f32>, Vec<u
                     let q = ((v * inv).round() as i32 + 8).clamp(0, 15) as u32;
                     word |= q << (n * 4);
                 }
-                quants[r * (cols / 8) + b * 4 + w] = word;
+                quants[o * (in_f / 8) + b * 4 + w] = word;
             }
         }
     }

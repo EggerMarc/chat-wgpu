@@ -170,6 +170,40 @@ sampling for meta-ML). No config-flag struct.
       `qmv` structure. Portable WGSL (subgroups on Metal/Vulkan/DX12). The
       megakernel being slower was the occupancy signal pointing here.
 
+      ## ⚠️ UPDATE: KERNEL INNER-LOOP IS NOT THE BOTTLENECK EITHER
+      Implemented the qmv-style kernel and measured each lever in isolation
+      (`examples/bench.rs`, down-proj 3072×1024, M1):
+      - **subgroups work in wgpu 29** despite naga rejecting `enable subgroups;`
+        — the subgroup builtins (`subgroupAdd`, `subgroup_invocation_id`) are
+        recognized directly; just omit the directive + request `Features::SUBGROUP`.
+        `subgroupAdd` vs 6-barrier reduction: 327→226 µs. Real win, kept.
+      - **vectorized `vec4<u32>` loads: no change.** Not instruction-bound.
+      - **4 outputs per subgroup (MLP/x-reuse): no change.** Not occupancy/latency-
+        bound from too-few-threads either.
+      The cached-bind-group, reused-buffer cost is pinned at **~150 µs/GEMV**
+      regardless of the inner loop. Decomposition:
+      - ~107 µs of the naive number was per-iter **buffer alloc + bind-group
+        create** — which the arena/bg-cache already removes in real generate.
+      - The remaining ~150 µs is **per-dispatch fixed cost**: a single decode GEMV
+        is M=1 (one token) and can't saturate bandwidth; serialized dependent
+        dispatches each pay a compute-pass barrier / pipeline drain (~50–100 µs).
+        Native Metal does a dispatch in 2.8 µs; wgpu's per-pass cost is ~18× that.
+      **Corrected diagnosis: we are dispatch-bound, not bandwidth-bound.** ~560
+      dispatches/token × a mostly-serial dependency chain. The "3.5 GB/s" framing
+      was misleading — MLX doesn't hit 200 GB/s on decode either; it wins with far
+      fewer, fused kernels (~50 ops/token, not 560). Real model now 82 ms → 6.5 tok/s.
+
+      **Fix = fewer serialized passes**, two complementary levers:
+      1. **Batch independent dispatches into one compute pass** (no barrier
+         between): q/k/v read the same `normed` and write distinct buffers →
+         overlap; same for gate/up. Needs a `ctx.run_grouped` recording N
+         dispatches in one `begin_compute_pass`. Direct attack on the per-pass cost.
+      2. **Fuse cheap ops into matmuls** to shorten the chain: residual-add into
+         the wo/down GEMV output; q_norm+rope (and k_norm+rope) into one kernel;
+         rope-k / wv writing straight into the KV cache (drop the copies); swiglu
+         into the down GEMV's input. ~560 → ~150 dispatches.
+      Subgroup q4 GEMV (vectorized, 1 output/subgroup) is the locked-in base.
+
 ## 3. Browser API
 
 - [ ] **`wasm-bindgen` `LocalChat`** — `new(ggufBytes, tokenizerBytes)` +

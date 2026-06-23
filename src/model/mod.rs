@@ -68,31 +68,45 @@ pub async fn generate<M: Model>(
     let mut produced = Vec::with_capacity(max_new);
     let mut next_input = prompt[0];
 
+    // Optional GPU profiling: `WGPU_PROFILE=<decode-token-index>` captures a
+    // per-kernel GPU timestamp breakdown for that one token (default index 1).
+    // See PROFILING.md.
+    let profile_token: Option<usize> = std::env::var("WGPU_PROFILE")
+        .ok()
+        .map(|v| v.trim().parse().unwrap_or(1));
+
     // One unified step per token (prompt *and* generated): reset the frame →
     // embed → forward → lm-head → read. The op sequence is identical every step,
     // so the bind-group cache stays aligned across tokens. (During the prompt
     // the logits are just discarded.)
     for pos in 0..total {
         ctx.reset_frame();
-        // PROFILE: split CPU-record (all the ctx.run calls) from GPU+sync (read).
+        let decode_idx = pos.checked_sub(prompt.len()); // Some(i) once decoding
+        let profiling = decode_idx.is_some() && decode_idx == profile_token;
+        if profiling {
+            ctx.begin_profile();
+        }
+
+        // Split CPU-record (all the ctx.run calls) from GPU-execute (read+sync).
         #[cfg(not(target_arch = "wasm32"))]
         let t0 = std::time::Instant::now();
         let x = model.embed(ctx, next_input);
         let hidden = model.forward(ctx, &x, pos, &mut cache, hook);
         let logits = model.logits(ctx, &hidden);
         #[cfg(not(target_arch = "wasm32"))]
-        let t_rec = t0.elapsed().as_secs_f64() * 1000.0;
+        let t_record_ms = t0.elapsed().as_secs_f64() * 1000.0;
         #[cfg(not(target_arch = "wasm32"))]
-        let t1 = std::time::Instant::now();
+        let t_gpu = std::time::Instant::now();
         let lv = ctx.read(&logits, vocab).await; // flush + GPU sync
         #[cfg(not(target_arch = "wasm32"))]
-        if pos >= prompt.len() && pos < prompt.len() + 4 {
+        if let Some(i) = decode_idx.filter(|&i| i < 4) {
             eprintln!(
-                "[profile] token {}: record(CPU)={:.1}ms  read(GPU+sync)={:.1}ms",
-                pos - prompt.len(),
-                t_rec,
-                t1.elapsed().as_secs_f64() * 1000.0
+                "[profile] decode token {i}: record(CPU)={t_record_ms:.1}ms  read(GPU+sync)={:.1}ms",
+                t_gpu.elapsed().as_secs_f64() * 1000.0
             );
+        }
+        if profiling {
+            crate::profile::print_report(&ctx.report_profile().await);
         }
         let tok = argmax(&lv);
         if pos + 1 < prompt.len() {

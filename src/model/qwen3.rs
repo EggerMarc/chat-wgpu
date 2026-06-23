@@ -29,10 +29,7 @@ struct Layer {
 pub struct Qwen3 {
     layers: Vec<Layer>,
     final_norm: RmsNorm,
-    /// Input embedding table, raw `[vocab, dim]` (row-major) for row gather.
     embed: wgpu::Buffer,
-    /// LM head `[dim, vocab]`. Tied to `embed` if the GGUF ships no
-    /// `output.weight`.
     lm_head: Proj,
     vocab: usize,
     dim: usize,
@@ -66,8 +63,22 @@ impl Model for Qwen3 {
                     wk: Proj::load(ctx, w, quantize, &format!("{p}.attn_k"), dim, kv_dim),
                     wv: Proj::load(ctx, w, quantize, &format!("{p}.attn_v"), dim, kv_dim),
                     wo: Proj::load(ctx, w, quantize, &format!("{p}.attn_output"), q_dim, dim),
-                    q_norm: RmsNorm::load(ctx, w, &format!("{p}.attn_q_norm"), head_dim, eps, false),
-                    k_norm: RmsNorm::load(ctx, w, &format!("{p}.attn_k_norm"), head_dim, eps, false),
+                    q_norm: RmsNorm::load(
+                        ctx,
+                        w,
+                        &format!("{p}.attn_q_norm"),
+                        head_dim,
+                        eps,
+                        false,
+                    ),
+                    k_norm: RmsNorm::load(
+                        ctx,
+                        w,
+                        &format!("{p}.attn_k_norm"),
+                        head_dim,
+                        eps,
+                        false,
+                    ),
                     ffn_norm: RmsNorm::load(ctx, w, &format!("{p}.ffn_norm"), dim, eps, false),
                     gate: Proj::load(ctx, w, quantize, &format!("{p}.ffn_gate"), dim, hidden),
                     up: Proj::load(ctx, w, quantize, &format!("{p}.ffn_up"), dim, hidden),
@@ -79,7 +90,11 @@ impl Model for Qwen3 {
         // Embedding table raw `[vocab, dim]` for row gather; LM head transposed
         // `[dim, vocab]`, tied to the embedding when `output.weight` is absent.
         let embed = w.vector(ctx, "token_embd.weight", vocab * dim);
-        let lm_name = if w.has("output.weight") { "output" } else { "token_embd" };
+        let lm_name = if w.has("output.weight") {
+            "output"
+        } else {
+            "token_embd"
+        };
         let lm_head = Proj::load(ctx, w, quantize, lm_name, dim, vocab);
 
         Ok(Self {
@@ -98,7 +113,12 @@ impl Model for Qwen3 {
     }
 
     fn new_cache(&self, ctx: &GpuContext, max_seq: usize) -> KvCache {
-        KvCache::new(ctx, self.layers.len(), self.n_kv_heads * self.head_dim, max_seq)
+        KvCache::new(
+            ctx,
+            self.layers.len(),
+            self.n_kv_heads * self.head_dim,
+            max_seq,
+        )
     }
 
     fn vocab_size(&self) -> usize {
@@ -126,21 +146,24 @@ impl Model for Qwen3 {
     ) -> wgpu::Buffer {
         let mut hidden = clone_buf(ctx, x, self.dim);
         for (i, l) in self.layers.iter().enumerate() {
-            // ── attention sublayer ──
             let normed = l.attn_norm.forward(ctx, &hidden, 1);
-            // One fused QKV matmul, then slice out q / k / v (cheap copies).
             let q = l.wq.forward(ctx, &normed);
             let k = l.wk.forward(ctx, &normed);
             let v = l.wv.forward(ctx, &normed);
 
-            // per-head QK-Norm (each head's head_dim vector), then RoPE
             let q = l.q_norm.forward(ctx, &q, self.n_heads);
             let k = l.k_norm.forward(ctx, &k, self.n_kv_heads);
             let q = rope::rope(ctx, &q, self.n_heads, self.head_dim, pos, self.rope_theta);
-            let k = rope::rope(ctx, &k, self.n_kv_heads, self.head_dim, pos, self.rope_theta);
+            let k = rope::rope(
+                ctx,
+                &k,
+                self.n_kv_heads,
+                self.head_dim,
+                pos,
+                self.rope_theta,
+            );
             hook.tap("q", i, &q, self.n_heads * self.head_dim);
 
-            // append this token's K/V to the cache, attend over the prefix
             cache.write(ctx, i, pos, &k, &v);
             let attn = attention::attention(
                 ctx,
@@ -156,11 +179,6 @@ impl Model for Qwen3 {
             hidden = attention::add(ctx, &hidden, &attn_out, self.dim);
             hook.tap("post_attn", i, &hidden, self.dim);
 
-            // ── MLP sublayer (SwiGLU) ──
-            // (A whole-MLP megakernel was tested — see kernels/mlp_mega — and is
-            // *slower* for decode: one token forces one workgroup, ~1% GPU
-            // occupancy. Separate full-occupancy matmuls win despite the
-            // inter-pass barriers.)
             let normed = l.ffn_norm.forward(ctx, &hidden, 1);
             let gate = l.gate.forward(ctx, &normed);
             let up = l.up.forward(ctx, &normed);
@@ -173,10 +191,7 @@ impl Model for Qwen3 {
     }
 }
 
-/// Copy a buffer (the input embedding) so `forward` owns a mutable hidden state.
 fn clone_buf(ctx: &GpuContext, src: &wgpu::Buffer, len: usize) -> wgpu::Buffer {
-    // residual add with a zero buffer = a copy, using the existing kernel.
     let zero = ctx.storage(&vec![0.0f32; len]);
     attention::add(ctx, src, &zero, len)
 }
-

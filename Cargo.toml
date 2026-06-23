@@ -11,16 +11,22 @@ path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 # Kernel-correctness harness: GPU known-answer checks + a Qwen3 forward + loader
-# round-trip tests. Native only.
+# round-trip tests. Native only. Run: `cargo run --bin verify`.
 [[bin]]
 name = "verify"
 path = "src/main.rs"
-required-features = ["verify"]
 
-# Native end-to-end: load a real GGUF + tokenizer and generate text.
+# Native end-to-end: load a real GGUF + tokenizer and generate text. Run:
+# `cargo run --release --example generate -- <gguf> <tok> "prompt" 64 --quantize`
 [[example]]
 name = "generate"
-required-features = ["verify"]
+
+# Kernel microbenchmark (µs / GB·s per kernel, no model). Run:
+# `cargo run --release --example bench`. Explicit path so it never collides with
+# the legacy `examples/bench/` spike crate.
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
 
 [dependencies]
 wgpu = "29"
@@ -32,7 +38,8 @@ serde_json = "1"
 # Tokenizer (HF) — the only non-kernel dependency; wasm-capable.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokenizers = "0.22"
-pollster = { version = "0.4", optional = true }
+# block_on for the native bin/examples (async GPU readback). Native only; tiny.
+pollster = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }
@@ -41,10 +48,6 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.2", features = ["js"] }
-
-[features]
-default = []
-verify = ["dep:pollster"]
 
 [profile.release]
 opt-level = 3

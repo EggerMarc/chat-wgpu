@@ -11,6 +11,17 @@ use std::collections::HashMap;
 
 use wgpu::util::DeviceExt;
 
+use crate::profile::Profiler;
+
+/// A compute pipeline plus its kernel name. The name becomes the GPU
+/// compute-pass label (visible in Xcode / Metal captures) and the key the
+/// timestamp profiler aggregates by. Built by [`GpuContext::pipeline`].
+#[derive(Clone)]
+pub struct Kernel {
+    pub pipeline: wgpu::ComputePipeline,
+    pub name: &'static str,
+}
+
 pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -39,6 +50,10 @@ pub struct GpuContext {
     /// `create_bind_group` is wgpu's ~0.3 ms/op cost.
     op_index: Cell<usize>,
     bg_cache: RefCell<Vec<Option<wgpu::BindGroup>>>,
+    /// GPU timestamp profiler. `None` unless `begin_profile` was called this
+    /// frame (and the adapter supports TIMESTAMP_QUERY). See `src/profile.rs`.
+    profiler: RefCell<Option<Profiler>>,
+    timestamps_supported: bool,
 }
 
 impl GpuContext {
@@ -53,10 +68,16 @@ impl GpuContext {
             .await
             .map_err(|e| format!("no adapter: {e:?}"))?;
         let backend = format!("{:?}", adapter.get_info().backend);
+        // Subgroup ops (subgroupAdd) for fast GEMV reductions, and timestamp
+        // queries for the GPU profiler — request whichever the adapter exposes
+        // (Metal/Vulkan/DX12 support both).
+        let wanted = wgpu::Features::SUBGROUP | wgpu::Features::TIMESTAMP_QUERY;
+        let features = adapter.features() & wanted;
+        let timestamps_supported = features.contains(wgpu::Features::TIMESTAMP_QUERY);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
-                required_features: wgpu::Features::empty(),
+                required_features: features,
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::Performance,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
@@ -77,8 +98,33 @@ impl GpuContext {
             cursor: Cell::new(0),
             op_index: Cell::new(0),
             bg_cache: RefCell::new(Vec::new()),
+            profiler: RefCell::new(None),
+            timestamps_supported,
         })
     }
+
+    /// Start capturing per-kernel GPU timestamps for the next frame. Pair with
+    /// [`report_profile`](Self::report_profile) after the frame's readback.
+    /// No-op (with a warning) if the adapter lacks TIMESTAMP_QUERY.
+    pub fn begin_profile(&self) {
+        if !self.timestamps_supported {
+            eprintln!("[profile] TIMESTAMP_QUERY unsupported on this adapter — skipping");
+            return;
+        }
+        *self.profiler.borrow_mut() = Some(Profiler::new(&self.device, &self.queue, 2048));
+    }
+
+    /// Finish a profile started with [`begin_profile`](Self::begin_profile):
+    /// map the timestamps and aggregate per kernel. Returns
+    /// `(kernel, passes, total_ms)` sorted by total. Call after `read`.
+    pub async fn report_profile(&self) -> Vec<(&'static str, u32, f64)> {
+        let prof = self.profiler.borrow_mut().take();
+        match prof {
+            Some(p) => p.report(&self.device).await,
+            None => vec![],
+        }
+    }
+
 
     /// Run a closure with the shared command encoder, lazily creating it.
     fn record(&self, f: impl FnOnce(&mut wgpu::CommandEncoder)) {
@@ -93,7 +139,11 @@ impl GpuContext {
     /// Submit any pending recorded ops as one command buffer, then release the
     /// resources that were keeping them alive.
     pub fn flush(&self) {
-        if let Some(enc) = self.encoder.borrow_mut().take() {
+        if let Some(mut enc) = self.encoder.borrow_mut().take() {
+            // Resolve profiler timestamps into the same submit, if profiling.
+            if let Some(p) = self.profiler.borrow().as_ref() {
+                p.resolve(&mut enc);
+            }
             self.queue.submit([enc.finish()]);
             self.retained_bg.borrow_mut().clear();
             self.retained_buf.borrow_mut().clear();
@@ -101,9 +151,10 @@ impl GpuContext {
     }
 
     /// Get-or-build a compute pipeline for `(name, wgsl, entry)`, cached by name.
-    pub fn pipeline(&self, name: &'static str, wgsl: &str, entry: &str) -> wgpu::ComputePipeline {
+    /// Returns a [`Kernel`] so the name rides along to the pass label + profiler.
+    pub fn pipeline(&self, name: &'static str, wgsl: &str, entry: &str) -> Kernel {
         if let Some(p) = self.pipelines.borrow().get(name) {
-            return p.clone();
+            return Kernel { pipeline: p.clone(), name };
         }
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(name),
@@ -120,7 +171,7 @@ impl GpuContext {
                 cache: None,
             });
         self.pipelines.borrow_mut().insert(name, pipeline.clone());
-        pipeline
+        Kernel { pipeline, name }
     }
 
     pub fn storage(&self, data: &[f32]) -> wgpu::Buffer {
@@ -232,7 +283,7 @@ impl GpuContext {
         b
     }
 
-    fn make_bind_group(&self, pipeline: &wgpu::ComputePipeline, binds: &[&wgpu::Buffer]) -> wgpu::BindGroup {
+    fn make_bind_group(&self, kernel: &Kernel, binds: &[&wgpu::Buffer]) -> wgpu::BindGroup {
         let entries: Vec<wgpu::BindGroupEntry> = binds
             .iter()
             .enumerate()
@@ -242,24 +293,38 @@ impl GpuContext {
             })
             .collect();
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
+            label: Some(kernel.name),
+            layout: &kernel.pipeline.get_bind_group_layout(0),
             entries: &entries,
         })
     }
 
-    fn dispatch(&self, pipeline: &wgpu::ComputePipeline, bind_group: &wgpu::BindGroup, wg: (u32, u32, u32)) {
-        let pipeline = pipeline.clone();
+    fn dispatch(&self, kernel: &Kernel, bind_group: &wgpu::BindGroup, wg: (u32, u32, u32)) {
+        let pipeline = kernel.pipeline.clone();
         let bind_group = bind_group.clone();
+        let name = kernel.name;
+        // Reserve a begin/end timestamp pair if a profile is active. The borrow
+        // of `profiler` (and thus the QuerySet) is held across `record`, which
+        // runs the closure synchronously, so the &QuerySet stays valid.
+        let prof = self.profiler.borrow();
+        let pair = prof
+            .as_ref()
+            .and_then(|p| p.reserve(name).map(|(b, e)| (p.query_set(), b, e)));
         self.record(move |enc| {
+            let timestamp_writes = pair.map(|(qs, b, e)| wgpu::ComputePassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(b),
+                end_of_pass_write_index: Some(e),
+            });
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
+                label: Some(name),
+                timestamp_writes,
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(wg.0, wg.1, wg.2);
         });
+        drop(prof);
     }
 
     /// Dispatch with a **cached** bind group (keyed by op index within the
@@ -267,7 +332,7 @@ impl GpuContext {
     /// what removes wgpu's ~0.3 ms/op `create_bind_group` cost. Safe only when
     /// the buffers bound at this op index are the same every token (arena +
     /// fixed op sequence), and the uniform content doesn't vary per token.
-    pub fn run(&self, pipeline: &wgpu::ComputePipeline, binds: &[&wgpu::Buffer], workgroups: (u32, u32, u32)) {
+    pub fn run(&self, kernel: &Kernel, binds: &[&wgpu::Buffer], workgroups: (u32, u32, u32)) {
         let idx = self.op_index.get();
         self.op_index.set(idx + 1);
         let mut cache = self.bg_cache.borrow_mut();
@@ -275,19 +340,19 @@ impl GpuContext {
             cache.push(None);
         }
         let bg = cache[idx]
-            .get_or_insert_with(|| self.make_bind_group(pipeline, binds))
+            .get_or_insert_with(|| self.make_bind_group(kernel, binds))
             .clone();
         drop(cache);
-        self.dispatch(pipeline, &bg, workgroups);
+        self.dispatch(kernel, &bg, workgroups);
     }
 
     /// Dispatch with a fresh bind group every call — for ops whose bound
     /// uniform varies per token (RoPE position, attention seq length), so the
     /// cache can't apply. Still advances the op index to keep cache alignment.
-    pub fn run_uncached(&self, pipeline: &wgpu::ComputePipeline, binds: &[&wgpu::Buffer], workgroups: (u32, u32, u32)) {
+    pub fn run_uncached(&self, kernel: &Kernel, binds: &[&wgpu::Buffer], workgroups: (u32, u32, u32)) {
         self.op_index.set(self.op_index.get() + 1);
-        let bg = self.make_bind_group(pipeline, binds);
-        self.dispatch(pipeline, &bg, workgroups);
+        let bg = self.make_bind_group(kernel, binds);
+        self.dispatch(kernel, &bg, workgroups);
         self.retained_bg.borrow_mut().push(bg);
     }
 

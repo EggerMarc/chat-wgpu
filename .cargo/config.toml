@@ -1,0 +1,10 @@
+# Short aliases for the common dev loops. (`cargo bench` is reserved by cargo,
+# so the kernel microbench is `cargo gpubench`.)
+[alias]
+# Kernel microbenchmark — µs / GB·s per kernel, no model needed.
+gpubench = "run --release --example bench"
+# Kernel-correctness harness (GPU known-answer checks + Qwen3 forward).
+checks = "run --release --bin verify"
+# End-to-end generate (the alias already ends in `--`, so don't add another):
+#   cargo gen <gguf> <tok> "prompt" 64 --quantize
+gen = "run --release --example generate --"
