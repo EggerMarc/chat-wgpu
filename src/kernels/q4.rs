@@ -15,10 +15,13 @@ pub fn gemv(
     out_f: usize,
 ) -> wgpu::Buffer {
     let out = ctx.empty(out_f);
-    // One subgroup (32 lanes) per output row; grid tiled across x/y since the
-    // dispatch dimension caps at 65535 (out_f reaches the vocab size).
-    let grid_x = (out_f as u32).min(65535);
-    let grid_y = (out_f as u32).div_ceil(grid_x);
+    // One subgroup computes ROWS (=4) output rows; grid tiled across x/y since the
+    // dispatch dimension caps at 65535 (out_f reaches the vocab size). Must match
+    // ROWS in q4.wgsl.
+    const ROWS: u32 = 4;
+    let groups = (out_f as u32).div_ceil(ROWS);
+    let grid_x = groups.min(65535);
+    let grid_y = groups.div_ceil(grid_x);
     let dims = [in_f as u32, out_f as u32, grid_x, 0u32];
     let dims_buf = ctx.uniform(bytemuck::cast_slice(&dims));
     let pipeline = ctx.pipeline("q4_gemv", WGSL, "main");

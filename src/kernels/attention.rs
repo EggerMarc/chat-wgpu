@@ -22,6 +22,9 @@ pub fn attention(
     u[8..12].copy_from_slice(&(seq as u32).to_le_bytes());
     u[12..16].copy_from_slice(&(head_dim as u32).to_le_bytes());
     u[16..20].copy_from_slice(&scale.to_le_bytes());
+    // heads_per_kv: GQA group size. The shader maps query head h → KV head
+    // h / heads_per_kv; leaving it 0 divides by zero and breaks the mapping.
+    u[20..24].copy_from_slice(&((n_heads / n_kv_heads) as u32).to_le_bytes());
     let dims_buf = ctx.uniform(&u);
     let pipeline = ctx.pipeline("attention", ATTN_WGSL, "main");
     // One workgroup (= one 32-lane subgroup) per head; the lanes split the KV
